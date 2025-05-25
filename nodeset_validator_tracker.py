@@ -566,7 +566,7 @@ class NodeSetValidatorTracker:
 
 def main():
     """Main execution function."""
-    eth_client_url = os.getenv('ETH_CLIENT_URL', 'http://localhost:8545')
+    eth_client_url = os.getenv('ETH_CLIENT_URL')
     beacon_api_url = os.getenv('BEACON_API_URL')
     
     tracker = NodeSetValidatorTracker(eth_client_url, beacon_api_url)
