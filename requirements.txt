@@ -1,0 +1,7 @@
+# Core dependencies
+web3>=6.0.0,<7.0.0
+requests>=2.28.0,<3.0.0
+
+# Ethereum ABI encoding/decoding
+eth-abi>=4.0.0,<5.0.0
+
