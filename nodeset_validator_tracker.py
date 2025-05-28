@@ -519,7 +519,7 @@ class NodeSetValidatorTracker:
         operator_list = [(addr, count) for addr, count in active_per_operator.items()]
         operator_list.sort(key=lambda x: x[1], reverse=True)
 
-        for addr, active_count in operator_list[:15]:
+        for addr, active_count in operator_list[:5]:
             exited_count = operator_exited.get(addr, 0)
             total_ever = operator_validators.get(addr, 0)
             if exited_count > 0:
