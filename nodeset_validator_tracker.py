@@ -1,16 +1,11 @@
 """
-NodeSet Validator Tracker
+NodeSet Validator Tracker - Fixed Version
 
-Analyzes blockchain transactions to identify NodeSet validators and tracks their
-lifecycle including creation, activation, and exits. Provides comprehensive
-monitoring and reporting capabilities for NodeSet protocol validator operations.
-
-Requirements:
-    - ETH_CLIENT_URL: Ethereum node endpoint
-    - BEACON_API_URL: Beacon chain API endpoint (optional, required for exit tracking)
-
-Usage:
-    python nodeset_validator_tracker.py
+Main Fixes:
+1. Added missing imports at the top
+2. Fixed event topic comparison in _extract_pubkeys_from_deposit() and _analyze_transaction()
+3. Fixed cache variable scoping issue in _get_validator_index()
+4. Added environment variable validation in main()
 """
 
 import os
@@ -22,6 +17,7 @@ from collections import Counter, defaultdict
 from typing import Dict, List, Tuple, Set, Optional
 from web3 import Web3
 import http.client
+from eth_abi import decode  # Moved to top-level import
 
 # Configuration
 logging.basicConfig(
@@ -35,7 +31,7 @@ logging.basicConfig(
 BEACON_DEPOSIT_CONTRACT = "0x00000000219ab540356cBB839Cbe05303d7705Fa"
 NODESET_VAULT_ADDRESS = "0xB266274F55e784689e97b7E363B0666d92e6305B"
 MULTICALL_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
-BEACON_DEPOSIT_EVENT = "0x649bbc62d0e31342afea4e5cd82d4049e7e1ee912fc0889aa790803be39038c5"
+BEACON_DEPOSIT_EVENT = "0x649bbc62d0e31342afea4e5cd82d4049e7e1ee912fc0889aa790803be39038c5"  # With 0x prefix
 DEPLOYMENT_BLOCK = 22318339
 CHUNK_SIZE = 5000
 CACHE_FILE = "nodeset_validator_tracker_cache.json"
@@ -122,8 +118,15 @@ class NodeSetValidatorTracker:
 
         for log in tx_receipt['logs']:
             if (log['address'].lower() != BEACON_DEPOSIT_CONTRACT.lower() or
-                len(log['topics']) == 0 or
-                log['topics'][0].hex().lower() != BEACON_DEPOSIT_EVENT.lower()):
+                len(log['topics']) == 0):
+                continue
+
+            # FIXED: Proper event topic comparison with 0x prefix handling
+            topic_hex = log['topics'][0].hex()
+            if not topic_hex.startswith('0x'):
+                topic_hex = '0x' + topic_hex
+                
+            if topic_hex.lower() != BEACON_DEPOSIT_EVENT.lower():
                 continue
 
             data = log['data'].hex() if hasattr(log['data'], 'hex') else log['data']
@@ -131,7 +134,6 @@ class NodeSetValidatorTracker:
                 data = data[2:]
 
             try:
-                from eth_abi import decode
                 types = ['bytes', 'bytes', 'bytes', 'bytes', 'bytes']
                 decoded = decode(types, bytes.fromhex(data))
                 pubkey_bytes = decoded[0]
@@ -147,14 +149,14 @@ class NodeSetValidatorTracker:
         return pubkeys
 
     def _get_validator_index(self, pubkey: str) -> Optional[int]:
-        # check cache
-        validator_indices = dict(self.cache.get('validator_indices', {}))
+        """Retrieve validator index from beacon API."""
+        # FIXED: Proper cache variable scoping
+        validator_indices = self.cache.get('validator_indices', {})
         if pubkey in validator_indices:
             cached_index = validator_indices[pubkey]
             if cached_index is not None:
                 return cached_index
 
-        """Retrieve validator index from beacon API."""
         if not self.beacon_api_url:
             return None
 
@@ -189,7 +191,6 @@ class NodeSetValidatorTracker:
             logging.debug("Error getting current epoch: %s", str(e))
 
         # Fallback calculation
-        import time
         current_time = int(time.time())
         slots_since_genesis = (current_time - GENESIS_TIME) // SECONDS_PER_SLOT
         return slots_since_genesis // SLOTS_PER_EPOCH
@@ -205,10 +206,14 @@ class NodeSetValidatorTracker:
             vault_events = 0
 
             for log in tx_receipt['logs']:
-                if (log['address'].lower() == BEACON_DEPOSIT_CONTRACT.lower() and
-                    len(log['topics']) > 0 and
-                    log['topics'][0].hex().lower() == BEACON_DEPOSIT_EVENT.lower()):
-                    beacon_deposits += 1
+                # FIXED: Proper event topic comparison with 0x prefix handling
+                if log['address'].lower() == BEACON_DEPOSIT_CONTRACT.lower() and len(log['topics']) > 0:
+                    topic_hex = log['topics'][0].hex()
+                    if not topic_hex.startswith('0x'):
+                        topic_hex = '0x' + topic_hex
+                        
+                    if topic_hex.lower() == BEACON_DEPOSIT_EVENT.lower():
+                        beacon_deposits += 1
                 elif log['address'].lower() == NODESET_VAULT_ADDRESS.lower():
                     vault_events += 1
 
@@ -220,7 +225,8 @@ class NodeSetValidatorTracker:
             return operator, 0
 
         except Exception as e:
-            logging.debug("Error analyzing transaction %s: %s", tx_hash, str(e))
+            logging.debug("Error analyzing transaction %s: %s", 
+                         tx_receipt.get('transactionHash', 'unknown'), str(e))
             return None, 0
 
     def _is_nodeset_transaction(self, tx: dict, tx_receipt: dict) -> bool:
@@ -266,7 +272,6 @@ class NodeSetValidatorTracker:
 
                 # Rate limiting
                 if i + batch_size < len(validator_list):
-                    import time
                     time.sleep(0.1)
 
             except Exception as e:
@@ -540,7 +545,7 @@ class NodeSetValidatorTracker:
         # Store performance data in cache for external tool access
         self.cache['operator_performance'] = dict(results)
         self.cache['performance_last_updated'] = int(time.time())
-        
+
         return results
 
     def generate_report(self, operator_validators: dict, operator_exited: dict,
@@ -659,7 +664,11 @@ class NodeSetValidatorTracker:
 
 def main():
     """Main execution function."""
+    # FIXED: Added environment variable validation
     eth_client_url = os.getenv('ETH_CLIENT_URL')
+    if not eth_client_url:
+        raise ValueError("ETH_CLIENT_URL environment variable is required")
+        
     beacon_api_url = os.getenv('BEACON_API_URL')
 
     tracker = NodeSetValidatorTracker(eth_client_url, beacon_api_url)
