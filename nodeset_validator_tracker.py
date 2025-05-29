@@ -15,6 +15,7 @@ Usage:
 
 import os
 import json
+import time
 import logging
 import requests
 from collections import Counter, defaultdict
@@ -48,26 +49,26 @@ class NodeSetValidatorTracker:
     """
     Tracks NodeSet validators from blockchain deposits through their complete lifecycle.
     """
-    
+
     def __init__(self, eth_client_url: str, beacon_api_url: Optional[str] = None):
         self.web3 = self._setup_web3(eth_client_url)
         self.beacon_api_url = self._setup_beacon_api(beacon_api_url)
         self.cache = self._load_cache()
-    
+
     def _setup_web3(self, eth_client_url: str) -> Web3:
         """Initialize Web3 connection."""
         web3 = Web3(Web3.HTTPProvider(eth_client_url))
         if not web3.is_connected():
             raise ConnectionError(f"Failed to connect to Ethereum node at {eth_client_url}")
-        
+
         logging.info("Connected to Ethereum node. Latest block: %d", web3.eth.block_number)
         return web3
-    
+
     def _setup_beacon_api(self, beacon_api_url: Optional[str]) -> Optional[str]:
         """Verify beacon API connectivity."""
         if not beacon_api_url:
             return None
-        
+
         try:
             response = requests.get(f"{beacon_api_url}/eth/v1/node/health", timeout=10)
             if response.status_code == 200:
@@ -75,9 +76,9 @@ class NodeSetValidatorTracker:
                 return beacon_api_url
         except Exception as e:
             logging.warning("Beacon API connection failed: %s", str(e))
-        
+
         return beacon_api_url
-    
+
     def _load_cache(self) -> dict:
         """Load cached analysis state."""
         if os.path.exists(CACHE_FILE):
@@ -100,49 +101,51 @@ class NodeSetValidatorTracker:
             'exited_pubkeys': [],
             'total_validators': 0,
             'total_exited': 0,
-            'processed_transactions': []
+            'processed_transactions': [],
+            'operator_performance': {},
+            'performance_last_updated': 0
         }
-    
+
     def _save_cache(self) -> None:
         """Persist analysis state to disk."""
         try:
             with open(CACHE_FILE, 'w') as f:
                 json.dump(self.cache, f, indent=2)
-            logging.info("Cache saved: %d active validators, %d exited", 
+            logging.info("Cache saved: %d active validators, %d exited",
                         self.cache.get('total_validators', 0), self.cache.get('total_exited', 0))
         except Exception as e:
             logging.error("Error saving cache: %s", str(e))
-    
+
     def _extract_pubkeys_from_deposit(self, tx_receipt: dict) -> List[str]:
         """Extract validator public keys from beacon deposit events."""
         pubkeys = []
-        
+
         for log in tx_receipt['logs']:
             if (log['address'].lower() != BEACON_DEPOSIT_CONTRACT.lower() or
                 len(log['topics']) == 0 or
                 log['topics'][0].hex().lower() != BEACON_DEPOSIT_EVENT.lower()):
                 continue
-            
+
             data = log['data'].hex() if hasattr(log['data'], 'hex') else log['data']
             if data.startswith('0x'):
                 data = data[2:]
-            
+
             try:
                 from eth_abi import decode
                 types = ['bytes', 'bytes', 'bytes', 'bytes', 'bytes']
                 decoded = decode(types, bytes.fromhex(data))
                 pubkey_bytes = decoded[0]
-                
+
                 if len(pubkey_bytes) == 48:
                     pubkey = "0x" + pubkey_bytes.hex()
                     pubkeys.append(pubkey)
                     logging.debug("Extracted pubkey: %s", pubkey[:20])
-                    
+
             except Exception as e:
                 logging.debug("Failed to decode deposit event: %s", str(e))
-        
+
         return pubkeys
-    
+
     def _get_validator_index(self, pubkey: str) -> Optional[int]:
         # check cache
         validator_indices = dict(self.cache.get('validator_indices', {}))
@@ -151,11 +154,10 @@ class NodeSetValidatorTracker:
             if cached_index is not None:
                 return cached_index
 
-
         """Retrieve validator index from beacon API."""
         if not self.beacon_api_url:
             return None
-        
+
         try:
             response = requests.get(
                 f"{self.beacon_api_url}/eth/v1/beacon/states/head/validators/{pubkey}",
@@ -166,17 +168,17 @@ class NodeSetValidatorTracker:
                 return int(data['data']['index'])
         except Exception as e:
             logging.debug("Error getting validator index for %s: %s", pubkey[:20], str(e))
-        
+
         return None
-    
+
     def _get_current_epoch(self) -> int:
         """Get current beacon chain epoch."""
         if not self.beacon_api_url:
             return 0
-        
+
         try:
             response = requests.get(
-                f"{self.beacon_api_url}/eth/v1/beacon/headers/head", 
+                f"{self.beacon_api_url}/eth/v1/beacon/headers/head",
                 timeout=10
             )
             if response.status_code == 200:
@@ -185,13 +187,13 @@ class NodeSetValidatorTracker:
                 return slot // SLOTS_PER_EPOCH
         except Exception as e:
             logging.debug("Error getting current epoch: %s", str(e))
-        
+
         # Fallback calculation
         import time
         current_time = int(time.time())
         slots_since_genesis = (current_time - GENESIS_TIME) // SECONDS_PER_SLOT
         return slots_since_genesis // SLOTS_PER_EPOCH
-    
+
     def _analyze_transaction(self, tx_receipt: dict) -> Tuple[Optional[str], int]:
         """Analyze transaction for validator deposits."""
         try:
@@ -211,7 +213,7 @@ class NodeSetValidatorTracker:
                     vault_events += 1
 
             if beacon_deposits > 0:
-                logging.info("TX %s: %d deposits, %d vault events", 
+                logging.info("TX %s: %d deposits, %d vault events",
                             tx_receipt['transactionHash'][:10].hex(), beacon_deposits, vault_events)
                 return operator, beacon_deposits
 
@@ -220,28 +222,28 @@ class NodeSetValidatorTracker:
         except Exception as e:
             logging.debug("Error analyzing transaction %s: %s", tx_hash, str(e))
             return None, 0
-    
+
     def _is_nodeset_transaction(self, tx: dict, tx_receipt: dict) -> bool:
         """Determine if transaction is NodeSet-related."""
         has_vault_logs = any(
             log['address'].lower() == NODESET_VAULT_ADDRESS.lower()
             for log in tx_receipt['logs']
         )
-        
-        is_multicall = (tx['to'] and 
+
+        is_multicall = (tx['to'] and
                        tx['to'].lower() == MULTICALL_ADDRESS.lower())
-        
+
         return has_vault_logs and is_multicall
-    
+
     def _check_validator_exits(self, tracked_indices: Set[int]) -> Dict[int, str]:
         """Check validator exit status via beacon API."""
         if not self.beacon_api_url or not tracked_indices:
             return {}
-        
+
         exited_validators = {}
         batch_size = 50
         validator_list = list(tracked_indices)
-        
+
         for i in range(0, len(validator_list), batch_size):
             batch = validator_list[i:i + batch_size]
             try:
@@ -250,29 +252,29 @@ class NodeSetValidatorTracker:
                     f"{self.beacon_api_url}/eth/v1/beacon/states/head/validators?id={validator_ids}",
                     timeout=30
                 )
-                
+
                 if response.status_code == 200:
                     data = response.json()
                     for validator in data.get('data', []):
                         index = int(validator['index'])
                         status = validator['status']
-                        
-                        if status in ['exited_unslashed', 'exited_slashed', 
+
+                        if status in ['exited_unslashed', 'exited_slashed',
                                      'withdrawal_possible', 'withdrawal_done']:
                             exited_validators[index] = status
                             logging.info("Validator %d status: %s", index, status)
-                
+
                 # Rate limiting
                 if i + batch_size < len(validator_list):
                     import time
                     time.sleep(0.1)
-                    
+
             except Exception as e:
                 logging.debug("Error checking validator batch: %s", str(e))
                 continue
-        
+
         return exited_validators
-    
+
     def scan_validators(self) -> Tuple[dict, int]:
         """Scan blockchain for NodeSet validator deposits."""
         start_block = max(self.cache['last_block'] + 1, DEPLOYMENT_BLOCK)
@@ -305,7 +307,7 @@ class NodeSetValidatorTracker:
 
                 if deposit_events:
                     print(f"Blocks {chunk_start:,}-{chunk_end:,}: {len(deposit_events)} deposits")
-                    
+
                     tx_deposits = defaultdict(list)
                     for event in deposit_events:
                         tx_hash = event['transactionHash'].hex()
@@ -331,7 +333,7 @@ class NodeSetValidatorTracker:
                         except Exception as e:
                             logging.debug("Error processing transaction %s: %s", tx_hash, str(e))
                             continue
-                            
+
                 elif chunk_start % 100000 == 0:
                     print(f"Blocks {chunk_start:,}-{chunk_end:,}: No deposits")
 
@@ -361,61 +363,61 @@ class NodeSetValidatorTracker:
 
         print(f"Scan complete: {total_validators} validators (+{new_validators} new)")
         return dict(operator_validators), total_validators
-    
+
     def track_exits(self) -> Tuple[dict, int]:
         """Track validator exits using beacon chain data."""
         if not self.beacon_api_url:
             return self.cache.get('exited_validators', {}), self.cache.get('total_exited', 0)
-        
+
         operator_pubkeys = defaultdict(list, self.cache.get('validator_pubkeys', {}))
         validator_indices = dict(self.cache.get('validator_indices', {}))
         operator_exited = defaultdict(int, self.cache.get('exited_validators', {}))
         total_exited = self.cache.get('total_exited', 0)
         pending_pubkeys = self.cache.get('pending_pubkeys', [])
-        
+
         processed_txs = self.cache.get('processed_transactions', [])
         current_indices = len(validator_indices)
         target_validators = self.cache.get('total_validators', 0)
-        
+
         # Extract pubkeys if needed
         if current_indices < target_validators:
             print(f"Extracting validator data from {len(processed_txs)} transactions")
             print(f"Current: {current_indices} indices, {len(pending_pubkeys)} pending, target: {target_validators}")
-            
+
             for i, tx_hash in enumerate(processed_txs):
                 try:
                     tx_receipt = self.web3.eth.get_transaction_receipt(tx_hash)
                     tx = self.web3.eth.get_transaction(tx_hash)
                     operator = tx['from']
-                    
+
                     pubkeys = self._extract_pubkeys_from_deposit(tx_receipt)
                     if pubkeys:
                         for pubkey in pubkeys:
                             if pubkey not in operator_pubkeys[operator]:
                                 operator_pubkeys[operator].append(pubkey)
-                            
+
                             if pubkey not in validator_indices and pubkey not in pending_pubkeys:
                                 index = self._get_validator_index(pubkey)
                                 if index is not None:
                                     validator_indices[pubkey] = index
                                 else:
                                     pending_pubkeys.append(pubkey)
-                    
+
                     if (i + 1) % 50 == 0:
                         print(f"Processed {i + 1}/{len(processed_txs)}: {len(validator_indices)} indices, {len(pending_pubkeys)} pending")
-                        
+
                 except Exception as e:
                     logging.debug("Error extracting from transaction %s: %s", tx_hash, str(e))
                     continue
-            
+
             print(f"Extraction complete: {len(validator_indices)} indices, {len(pending_pubkeys)} pending")
-        
+
         # Check pending activations
         if pending_pubkeys:
             print(f"Checking {len(pending_pubkeys)} pending validators")
             newly_activated = 0
             still_pending = []
-            
+
             for pubkey in pending_pubkeys:
                 index = self._get_validator_index(pubkey)
                 if index is not None:
@@ -423,24 +425,24 @@ class NodeSetValidatorTracker:
                     newly_activated += 1
                 else:
                     still_pending.append(pubkey)
-            
+
             if newly_activated > 0:
                 print(f"Activated: {newly_activated} validators")
-            
+
             pending_pubkeys = still_pending
-        
+
         # Check for exits
         if validator_indices:
             print(f"Checking exit status for {len(validator_indices)} validators")
             tracked_indices = set(validator_indices.values())
             exited_statuses = self._check_validator_exits(tracked_indices)
-            
+
             if exited_statuses:
                 print(f"Found {len(exited_statuses)} validators with exit status")
-                
+
                 new_exits = 0
                 exited_pubkeys = set(self.cache.get('exited_pubkeys', []))
-                
+
                 for pubkey, index in validator_indices.items():
                     if index in exited_statuses and pubkey not in exited_pubkeys:
                         for operator, pubkeys in operator_pubkeys.items():
@@ -451,18 +453,18 @@ class NodeSetValidatorTracker:
                                 exited_pubkeys.add(pubkey)
                                 print(f"Exit: Validator {index} ({operator[:10]}...) - {status}")
                                 break
-                
+
                 self.cache['exited_pubkeys'] = list(exited_pubkeys)
-                
+
                 if new_exits == 0:
                     print("All exits previously tracked")
                 else:
                     print(f"New exits found: {new_exits}")
-                
+
                 total_exited = sum(operator_exited.values())
             else:
                 print("No exited validators found")
-        
+
         # Update cache
         self.cache.update({
             'validator_pubkeys': {k: list(v) for k, v in operator_pubkeys.items()},
@@ -472,15 +474,16 @@ class NodeSetValidatorTracker:
             'total_exited': total_exited,
             'last_epoch_checked': self._get_current_epoch()
         })
-        
+
         return dict(operator_exited), total_exited
 
     def check_performance(self):
+        """Check validator attestation performance and store in cache."""
         beaconchain_conn = http.client.HTTPSConnection("beaconcha.in")
         validator_indices = dict(self.cache.get('validator_indices', {}))
         exited_pubkeys = set(self.cache.get('exited_pubkeys', []))
-        
-        # remove any exited pubkeys
+
+        # Remove any exited pubkeys
         pubkeys = [pk for pk in validator_indices.keys() if pk not in exited_pubkeys]
 
         batch_size = 100
@@ -490,7 +493,7 @@ class NodeSetValidatorTracker:
             batch = pubkeys[i:i + batch_size]
 
             try:
-                # get perfromance data from beaconchain
+                # Get performance data from beaconchain
                 endpoint = f"/api/v1/validator/{','.join(map(str, batch))}/attestationefficiency"
                 beaconchain_conn.request("GET", endpoint)
                 res = beaconchain_conn.getresponse()
@@ -534,17 +537,16 @@ class NodeSetValidatorTracker:
             if count > 0:
                 results.append((operator, total / count))
 
-        # results = sorted(results, key=lambda x: (x[1] is None, -x[1] if x[1] is not None else float('inf')))
-        # print("Final Performance Results:")
-        # for operator, avg_performance in results:
-        #     print(f"Operator: {operator}, Average Performance: {avg_performance:.2f}%")
+        # Store performance data in cache for external tool access
+        self.cache['operator_performance'] = dict(results)
+        self.cache['performance_last_updated'] = int(time.time())
+        
         return results
 
-    
-    def generate_report(self, operator_validators: dict, operator_exited: dict, 
+    def generate_report(self, operator_validators: dict, operator_exited: dict,
                        total_validators: int, total_exited: int, operator_performance: dict) -> None:
         """Generate comprehensive validator status report."""
-        
+
         # Calculate active validators per operator
         active_per_operator = {}
         for operator, total_count in operator_validators.items():
@@ -552,11 +554,11 @@ class NodeSetValidatorTracker:
             active_count = total_count - exited_count
             if active_count > 0:
                 active_per_operator[operator] = active_count
-        
+
         print("\n" + "="*70)
         print("NODESET VALIDATOR ANALYSIS REPORT")
         print("="*70)
-        
+
         # Active validator distribution
         print("\n=== ACTIVE VALIDATOR DISTRIBUTION ===")
         validator_counts = Counter(active_per_operator.values())
@@ -581,7 +583,7 @@ class NodeSetValidatorTracker:
         if operator_exited and any(operator_exited.values()):
             print("\n=== EXIT STATISTICS ===")
             exit_counts = Counter([c for c in operator_exited.values() if c > 0])
-            
+
             for exit_count in sorted(exit_counts.keys()):
                 operator_count = exit_counts[exit_count]
                 print(f"Operators with {exit_count} exits: {operator_count}")
@@ -598,11 +600,11 @@ class NodeSetValidatorTracker:
                 print(f"{active_count} active ({total_ever} total, {exited_count} exited): {addr}")
             else:
                 print(f"{active_count} validators: {addr}")
-        
+
         # Fully exited operators
-        fully_exited = [(op, cnt) for op, cnt in operator_validators.items() 
+        fully_exited = [(op, cnt) for op, cnt in operator_validators.items()
                        if operator_exited.get(op, 0) == cnt and cnt > 0]
-        
+
         if fully_exited:
             print("\n=== FULLY EXITED OPERATORS ===")
             for operator, count in fully_exited:
@@ -622,19 +624,16 @@ class NodeSetValidatorTracker:
             percent_str = f"{percent:.2f}%" if percent is not None else "N/A"
             print(f"Operator: {operator}, Efficiency: {percent_str}")
 
-
-
-    
     def run_analysis(self) -> None:
         """Execute complete validator analysis."""
         try:
             print("NodeSet Validator Tracker")
             print(f"Ethereum node: Connected")
             print(f"Beacon API: {'Connected' if self.beacon_api_url else 'Disabled'}")
-            
+
             # Scan for validators
             operator_validators, total_validators = self.scan_validators()
-            
+
             # Track exits if beacon API available
             operator_exited, total_exited = {}, 0
             if self.beacon_api_url and total_validators > 0:
@@ -642,16 +641,17 @@ class NodeSetValidatorTracker:
                 operator_exited, total_exited = self.track_exits()
                 self._save_cache()
 
-            # Check attestation peroformance
+            # Check attestation performance
             print(f"\nChecking performance for {total_validators} validators")
             operator_performance = self.check_performance()
-            
+            self._save_cache()  # Save performance data to cache
+
             # Generate report
-            self.generate_report(operator_validators, operator_exited, 
+            self.generate_report(operator_validators, operator_exited,
                                total_validators, total_exited, operator_performance)
-            
+
             logging.info("Analysis completed successfully")
-            
+
         except Exception as e:
             logging.error("Analysis failed: %s", str(e))
             raise
@@ -661,7 +661,7 @@ def main():
     """Main execution function."""
     eth_client_url = os.getenv('ETH_CLIENT_URL')
     beacon_api_url = os.getenv('BEACON_API_URL')
-    
+
     tracker = NodeSetValidatorTracker(eth_client_url, beacon_api_url)
     tracker.run_analysis()
 
