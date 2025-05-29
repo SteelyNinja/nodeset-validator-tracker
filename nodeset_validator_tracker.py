@@ -20,6 +20,7 @@ import requests
 from collections import Counter, defaultdict
 from typing import Dict, List, Tuple, Set, Optional
 from web3 import Web3
+import http.client
 
 # Configuration
 logging.basicConfig(
@@ -143,6 +144,14 @@ class NodeSetValidatorTracker:
         return pubkeys
     
     def _get_validator_index(self, pubkey: str) -> Optional[int]:
+        # check cache
+        validator_indices = dict(self.cache.get('validator_indices', {}))
+        if pubkey in validator_indices:
+            cached_index = validator_indices[pubkey]
+            if cached_index is not None:
+                return cached_index
+
+
         """Retrieve validator index from beacon API."""
         if not self.beacon_api_url:
             return None
@@ -465,9 +474,75 @@ class NodeSetValidatorTracker:
         })
         
         return dict(operator_exited), total_exited
+
+    def check_performance(self):
+        beaconchain_conn = http.client.HTTPSConnection("beaconcha.in")
+        validator_indices = dict(self.cache.get('validator_indices', {}))
+        exited_pubkeys = set(self.cache.get('exited_pubkeys', []))
+        
+        # remove any exited pubkeys
+        pubkeys = [pk for pk in validator_indices.keys() if pk not in exited_pubkeys]
+
+        batch_size = 100
+        performance_results = {}
+        for i in range(0, len(pubkeys), batch_size):
+            print(f"Fetching range {i} to {i + batch_size}...")
+            batch = pubkeys[i:i + batch_size]
+
+            try:
+                # get perfromance data from beaconchain
+                endpoint = f"/api/v1/validator/{','.join(map(str, batch))}/attestationefficiency"
+                beaconchain_conn.request("GET", endpoint)
+                res = beaconchain_conn.getresponse()
+                data = res.read().decode("utf-8")
+                res.close()
+
+                try:
+                    parsed = json.loads(data)
+                except json.JSONDecodeError as e:
+                    print(f"Failed to parse JSON for batch {i} to {i + batch_size}: {e}")
+                    continue
+
+                status = parsed.get("status")
+                if status == "OK":
+                    for entry in parsed.get("data", []):
+                        index = entry.get("validatorindex")
+                        efficiency = entry.get("attestation_efficiency")
+                        percent = max(0, round((2 - efficiency) * 100, 2))
+                        performance_results[index] = percent
+                else:
+                    print(f"Batch failed for range {i} to {i + batch_size}")
+
+            except Exception as e:
+                print(f"Error fetching performance for batch from {i} to {i + batch_size}: {e}")
+
+        beaconchain_conn.close()
+
+        # Calculate the mean for each operator
+        results = []
+        operator_pubkeys = defaultdict(list, self.cache.get('validator_pubkeys', {}))
+        for operator in operator_pubkeys:
+            total = 0
+            count = 0
+            for pubkey in operator_pubkeys[operator]:
+                index = self._get_validator_index(pubkey)
+                performance = performance_results.get(index, None)
+                if performance is not None:
+                    total += performance
+                    count += 1
+
+            if count > 0:
+                results.append((operator, total / count))
+
+        # results = sorted(results, key=lambda x: (x[1] is None, -x[1] if x[1] is not None else float('inf')))
+        # print("Final Performance Results:")
+        # for operator, avg_performance in results:
+        #     print(f"Operator: {operator}, Average Performance: {avg_performance:.2f}%")
+        return results
+
     
     def generate_report(self, operator_validators: dict, operator_exited: dict, 
-                       total_validators: int, total_exited: int) -> None:
+                       total_validators: int, total_exited: int, operator_performance: dict) -> None:
         """Generate comprehensive validator status report."""
         
         # Calculate active validators per operator
@@ -532,6 +607,23 @@ class NodeSetValidatorTracker:
             print("\n=== FULLY EXITED OPERATORS ===")
             for operator, count in fully_exited:
                 print(f"All {count} validators exited: {operator}")
+
+        # Worst attestation performance
+        print("\n=== WORST ATTESTATION PERFORMANCE ===")
+        sorted_operator_performance = sorted(operator_performance, key=lambda x: (x[1] is None, x[1]))
+        for operator, percent in list(reversed(sorted_operator_performance[:5])):
+            percent_str = f"{percent}%" if percent is not None else "N/A"
+            print(f"Operator: {operator}, Efficiency: {percent_str}")
+
+        # Best attestation performance
+        print("\n=== BEST ATTESTATION PERFORMANCE ===")
+        sorted_operator_performance = sorted(operator_performance, key=lambda x: (x[1] is None, -x[1] if x[1] is not None else float('inf')))
+        for operator, percent in sorted_operator_performance[:5]:
+            percent_str = f"{percent:.2f}%" if percent is not None else "N/A"
+            print(f"Operator: {operator}, Efficiency: {percent_str}")
+
+
+
     
     def run_analysis(self) -> None:
         """Execute complete validator analysis."""
@@ -549,10 +641,14 @@ class NodeSetValidatorTracker:
                 print(f"\nTracking exits for {total_validators} validators")
                 operator_exited, total_exited = self.track_exits()
                 self._save_cache()
+
+            # Check attestation peroformance
+            print(f"\nChecking performance for {total_validators} validators")
+            operator_performance = self.check_performance()
             
             # Generate report
             self.generate_report(operator_validators, operator_exited, 
-                               total_validators, total_exited)
+                               total_validators, total_exited, operator_performance)
             
             logging.info("Analysis completed successfully")
             
