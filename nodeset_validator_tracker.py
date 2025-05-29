@@ -183,16 +183,13 @@ class NodeSetValidatorTracker:
         slots_since_genesis = (current_time - GENESIS_TIME) // SECONDS_PER_SLOT
         return slots_since_genesis // SLOTS_PER_EPOCH
     
-    def _analyze_transaction(self, tx_hash: str) -> Tuple[Optional[str], int]:
+    def _analyze_transaction(self, tx_receipt: dict) -> Tuple[Optional[str], int]:
         """Analyze transaction for validator deposits."""
         try:
-            tx = self.web3.eth.get_transaction(tx_hash)
-            tx_receipt = self.web3.eth.get_transaction_receipt(tx_hash)
-
             if tx_receipt['status'] != 1:
                 return None, 0
 
-            operator = tx['from']
+            operator = tx_receipt['from']
             beacon_deposits = 0
             vault_events = 0
 
@@ -206,7 +203,7 @@ class NodeSetValidatorTracker:
 
             if beacon_deposits > 0:
                 logging.info("TX %s: %d deposits, %d vault events", 
-                            tx_hash[:10], beacon_deposits, vault_events)
+                            tx_receipt['transactionHash'][:10].hex(), beacon_deposits, vault_events)
                 return operator, beacon_deposits
 
             return operator, 0
@@ -314,7 +311,7 @@ class NodeSetValidatorTracker:
                             tx_receipt = self.web3.eth.get_transaction_receipt(tx_hash)
 
                             if self._is_nodeset_transaction(tx, tx_receipt):
-                                operator, validator_count = self._analyze_transaction(tx_hash)
+                                operator, validator_count = self._analyze_transaction(tx_receipt)
 
                                 if operator and validator_count > 0:
                                     operator_validators[operator] += validator_count
