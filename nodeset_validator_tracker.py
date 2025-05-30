@@ -119,7 +119,7 @@ class NodeSetValidatorTracker:
             topic_hex = log['topics'][0].hex()
             if not topic_hex.startswith('0x'):
                 topic_hex = '0x' + topic_hex
-                
+
             if topic_hex.lower() != BEACON_DEPOSIT_EVENT.lower():
                 continue
 
@@ -203,7 +203,7 @@ class NodeSetValidatorTracker:
                     topic_hex = log['topics'][0].hex()
                     if not topic_hex.startswith('0x'):
                         topic_hex = '0x' + topic_hex
-                        
+
                     if topic_hex.lower() == BEACON_DEPOSIT_EVENT.lower():
                         beacon_deposits += 1
                 elif log['address'].lower() == NODESET_VAULT_ADDRESS.lower():
@@ -217,7 +217,7 @@ class NodeSetValidatorTracker:
             return operator, 0
 
         except Exception as e:
-            logging.debug("Error analyzing transaction %s: %s", 
+            logging.debug("Error analyzing transaction %s: %s",
                          tx_receipt.get('transactionHash', 'unknown'), str(e))
             return None, 0
 
@@ -479,45 +479,65 @@ class NodeSetValidatorTracker:
         validator_indices = dict(self.cache.get('validator_indices', {}))
         exited_pubkeys = set(self.cache.get('exited_pubkeys', []))
 
-        # Remove any exited pubkeys
         pubkeys = [pk for pk in validator_indices.keys() if pk not in exited_pubkeys]
 
         batch_size = 100
         performance_results = {}
+        api_call_count = 0
+        
         for i in range(0, len(pubkeys), batch_size):
             print(f"Fetching range {i} to {i + batch_size}...")
             batch = pubkeys[i:i + batch_size]
 
-            try:
-                # Get performance data from beaconchain
-                endpoint = f"/api/v1/validator/{','.join(map(str, batch))}/attestationefficiency"
-                beaconchain_conn.request("GET", endpoint)
-                res = beaconchain_conn.getresponse()
-                data = res.read().decode("utf-8")
-                res.close()
-
+            while True:
                 try:
-                    parsed = json.loads(data)
-                except json.JSONDecodeError as e:
-                    print(f"Failed to parse JSON for batch {i} to {i + batch_size}: {e}")
-                    continue
+                    endpoint = f"/api/v1/validator/{','.join(map(str, batch))}/attestationefficiency"
+                    beaconchain_conn.request("GET", endpoint)
+                    res = beaconchain_conn.getresponse()
+                    
+                    if res.status == 429:
+                        print(f"Rate limit hit after {api_call_count} calls. Backing off for 60 seconds...")
+                        logging.warning("Rate limit encountered, backing off for 60 seconds")
+                        res.read()
+                        res.close()
+                        time.sleep(60)
+                        api_call_count = 0
+                        continue
+                    
+                    if res.status != 200:
+                        print(f"HTTP error {res.status} for batch {i} to {i + batch_size}")
+                        res.read()
+                        res.close()
+                        break
+                    
+                    data = res.read().decode("utf-8")
+                    res.close()
+                    api_call_count += 1
+                    
+                    try:
+                        parsed = json.loads(data)
+                    except json.JSONDecodeError as e:
+                        print(f"Failed to parse JSON for batch {i} to {i + batch_size}: {e}")
+                        break
 
-                status = parsed.get("status")
-                if status == "OK":
-                    for entry in parsed.get("data", []):
-                        index = entry.get("validatorindex")
-                        efficiency = entry.get("attestation_efficiency")
-                        percent = max(0, round((2 - efficiency) * 100, 2))
-                        performance_results[index] = percent
-                else:
-                    print(f"Batch failed for range {i} to {i + batch_size}")
-
-            except Exception as e:
-                print(f"Error fetching performance for batch from {i} to {i + batch_size}: {e}")
+                    status = parsed.get("status")
+                    if status == "OK":
+                        for entry in parsed.get("data", []):
+                            index = entry.get("validatorindex")
+                            efficiency = entry.get("attestation_efficiency")
+                            percent = max(0, round((2 - efficiency) * 100, 2))
+                            performance_results[index] = percent
+                    else:
+                        print(f"Batch failed for range {i} to {i + batch_size}")
+                    
+                    break
+                    
+                except Exception as e:
+                    print(f"Error fetching performance for batch from {i} to {i + batch_size}: {e}")
+                    break
 
         beaconchain_conn.close()
 
-        # Calculate the mean for each operator
         results = []
         operator_pubkeys = defaultdict(list, self.cache.get('validator_pubkeys', {}))
         for operator in operator_pubkeys:
@@ -533,7 +553,6 @@ class NodeSetValidatorTracker:
             if count > 0:
                 results.append((operator, total / count))
 
-        # Store performance data in cache for external tool access
         self.cache['operator_performance'] = dict(results)
         self.cache['performance_last_updated'] = int(time.time())
 
@@ -640,7 +659,7 @@ class NodeSetValidatorTracker:
             # Check attestation performance
             print(f"\nChecking performance for {total_validators} validators")
             operator_performance = self.check_performance()
-            self._save_cache()  # Save performance data to cache
+            self._save_cache()
 
             # Generate report
             self.generate_report(operator_validators, operator_exited,
@@ -655,11 +674,10 @@ class NodeSetValidatorTracker:
 
 def main():
     """Main execution function."""
-    # FIXED: Added environment variable validation
     eth_client_url = os.getenv('ETH_CLIENT_URL')
     if not eth_client_url:
         raise ValueError("ETH_CLIENT_URL environment variable is required")
-        
+
     beacon_api_url = os.getenv('BEACON_API_URL')
 
     tracker = NodeSetValidatorTracker(eth_client_url, beacon_api_url)
