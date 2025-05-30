@@ -1,11 +1,6 @@
 """
-NodeSet Validator Tracker - Fixed Version
+NodeSet Validator Tracker
 
-Main Fixes:
-1. Added missing imports at the top
-2. Fixed event topic comparison in _extract_pubkeys_from_deposit() and _analyze_transaction()
-3. Fixed cache variable scoping issue in _get_validator_index()
-4. Added environment variable validation in main()
 """
 
 import os
@@ -17,7 +12,7 @@ from collections import Counter, defaultdict
 from typing import Dict, List, Tuple, Set, Optional
 from web3 import Web3
 import http.client
-from eth_abi import decode  # Moved to top-level import
+from eth_abi import decode
 
 # Configuration
 logging.basicConfig(
@@ -31,7 +26,7 @@ logging.basicConfig(
 BEACON_DEPOSIT_CONTRACT = "0x00000000219ab540356cBB839Cbe05303d7705Fa"
 NODESET_VAULT_ADDRESS = "0xB266274F55e784689e97b7E363B0666d92e6305B"
 MULTICALL_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
-BEACON_DEPOSIT_EVENT = "0x649bbc62d0e31342afea4e5cd82d4049e7e1ee912fc0889aa790803be39038c5"  # With 0x prefix
+BEACON_DEPOSIT_EVENT = "0x649bbc62d0e31342afea4e5cd82d4049e7e1ee912fc0889aa790803be39038c5"
 DEPLOYMENT_BLOCK = 22318339
 CHUNK_SIZE = 5000
 CACHE_FILE = "nodeset_validator_tracker_cache.json"
@@ -121,7 +116,6 @@ class NodeSetValidatorTracker:
                 len(log['topics']) == 0):
                 continue
 
-            # FIXED: Proper event topic comparison with 0x prefix handling
             topic_hex = log['topics'][0].hex()
             if not topic_hex.startswith('0x'):
                 topic_hex = '0x' + topic_hex
@@ -150,7 +144,6 @@ class NodeSetValidatorTracker:
 
     def _get_validator_index(self, pubkey: str) -> Optional[int]:
         """Retrieve validator index from beacon API."""
-        # FIXED: Proper cache variable scoping
         validator_indices = self.cache.get('validator_indices', {})
         if pubkey in validator_indices:
             cached_index = validator_indices[pubkey]
@@ -206,7 +199,6 @@ class NodeSetValidatorTracker:
             vault_events = 0
 
             for log in tx_receipt['logs']:
-                # FIXED: Proper event topic comparison with 0x prefix handling
                 if log['address'].lower() == BEACON_DEPOSIT_CONTRACT.lower() and len(log['topics']) > 0:
                     topic_hex = log['topics'][0].hex()
                     if not topic_hex.startswith('0x'):
@@ -384,7 +376,6 @@ class NodeSetValidatorTracker:
         current_indices = len(validator_indices)
         target_validators = self.cache.get('total_validators', 0)
 
-        # Extract pubkeys if needed
         if current_indices < target_validators:
             print(f"Extracting validator data from {len(processed_txs)} transactions")
             print(f"Current: {current_indices} indices, {len(pending_pubkeys)} pending, target: {target_validators}")
