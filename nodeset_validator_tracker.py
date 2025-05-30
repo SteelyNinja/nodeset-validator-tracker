@@ -478,8 +478,10 @@ class NodeSetValidatorTracker:
         beaconchain_conn = http.client.HTTPSConnection("beaconcha.in")
         validator_indices = dict(self.cache.get('validator_indices', {}))
         exited_pubkeys = set(self.cache.get('exited_pubkeys', []))
+        pending_pubkeys = set(self.cache.get('pending_pubkeys', []))
 
-        pubkeys = [pk for pk in validator_indices.keys() if pk not in exited_pubkeys]
+        pubkeys = [pk for pk in validator_indices.keys() if pk not in exited_pubkeys or pk not in pending_pubkeys]
+        print(f"{len(exited_pubkeys)} exited and {len(pending_pubkeys)} pending validators, checking {len(pubkeys)} validators.")
 
         batch_size = 100
         performance_results = {}
@@ -538,14 +540,16 @@ class NodeSetValidatorTracker:
 
         beaconchain_conn.close()
 
+        print("Aggregating performance for each operator")
         results = []
         operator_pubkeys = defaultdict(list, self.cache.get('validator_pubkeys', {}))
-        for operator in operator_pubkeys:
+        for operator, pubkeys in operator_pubkeys.items():
             total = 0
             count = 0
-            for pubkey in operator_pubkeys[operator]:
+
+            for pubkey in pubkeys:
                 index = self._get_validator_index(pubkey)
-                performance = performance_results.get(index, None)
+                performance = performance_results.get(index)
                 if performance is not None:
                     total += performance
                     count += 1
@@ -629,7 +633,7 @@ class NodeSetValidatorTracker:
         print("\n=== WORST ATTESTATION PERFORMANCE ===")
         sorted_operator_performance = sorted(operator_performance, key=lambda x: (x[1] is None, x[1]))
         for operator, percent in list(reversed(sorted_operator_performance[:5])):
-            percent_str = f"{percent}%" if percent is not None else "N/A"
+            percent_str = f"{percent:.2f}%" if percent is not None else "N/A"
             print(f"Operator: {operator}, Efficiency: {percent_str}")
 
         # Best attestation performance
