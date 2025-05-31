@@ -22,6 +22,7 @@ pip install -r requirements.txt
 ```bash
 export ETH_CLIENT_URL="http://your-ethereum-node:8545"
 export BEACON_API_URL="http://your-beacon-api:5052"
+export ETHERSCAN_API_KEY='your api key'
 ```
 
 ## Usage
@@ -49,12 +50,14 @@ Maximum operator concentration: 0.0101
 |----------|-------------|----------|
 | `ETH_CLIENT_URL` | Ethereum execution client endpoint | Yes |
 | `BEACON_API_URL` | Beacon chain API endpoint | Yes |
+| `ETHERSCAN_API_KEY` | Etherscan API Key | Yes |
 
 ## Requirements
 
 - Python 3.8+
 - Ethereum execution client (Geth, Erigon, etc.)
 - Beacon chain API (Lighthouse, Prysm, Teku, Nimbus)
+- Etherscan API Key
 
 ## How It Works
 
