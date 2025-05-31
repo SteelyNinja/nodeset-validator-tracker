@@ -379,6 +379,8 @@ class NodeSetValidatorTracker:
         if current_indices < target_validators:
             print(f"Extracting validator data from {len(processed_txs)} transactions")
             print(f"Current: {current_indices} indices, {len(pending_pubkeys)} pending, target: {target_validators}")
+            logging.info("Starting validator data extraction: %d transactions to process, %d current indices, %d pending, target: %d",
+                        len(processed_txs), current_indices, len(pending_pubkeys), target_validators)
 
             for i, tx_hash in enumerate(processed_txs):
                 try:
@@ -396,21 +398,28 @@ class NodeSetValidatorTracker:
                                 index = self._get_validator_index(pubkey)
                                 if index is not None:
                                     validator_indices[pubkey] = index
+                                    logging.info("Mapped validator pubkey %s to index %d", pubkey[:20], index)
                                 else:
                                     pending_pubkeys.append(pubkey)
+                                    logging.info("Validator pubkey %s not yet activated, added to pending list", pubkey[:20])
 
                     if (i + 1) % 50 == 0:
                         print(f"Processed {i + 1}/{len(processed_txs)}: {len(validator_indices)} indices, {len(pending_pubkeys)} pending")
+                        logging.info("Extraction progress: %d/%d transactions processed, %d indices mapped, %d pending", 
+                                    i + 1, len(processed_txs), len(validator_indices), len(pending_pubkeys))
 
                 except Exception as e:
                     logging.debug("Error extracting from transaction %s: %s", tx_hash, str(e))
                     continue
 
             print(f"Extraction complete: {len(validator_indices)} indices, {len(pending_pubkeys)} pending")
+            logging.info("Validator extraction completed: %d total indices mapped, %d pending activation", 
+                        len(validator_indices), len(pending_pubkeys))
 
         # Check pending activations
         if pending_pubkeys:
             print(f"Checking {len(pending_pubkeys)} pending validators")
+            logging.info("Checking activation status for %d pending validators", len(pending_pubkeys))
             newly_activated = 0
             still_pending = []
 
@@ -419,12 +428,15 @@ class NodeSetValidatorTracker:
                 if index is not None:
                     validator_indices[pubkey] = index
                     newly_activated += 1
+                    logging.info("Previously pending validator %s now activated with index %d", pubkey[:20], index)
                 else:
                     still_pending.append(pubkey)
 
             if newly_activated > 0:
                 print(f"Activated: {newly_activated} validators")
+                logging.info("Newly activated validators: %d (was pending, now has index)", newly_activated)
 
+            logging.info("Still pending activation: %d validators", len(still_pending))
             pending_pubkeys = still_pending
 
         # Check for exits
@@ -484,7 +496,7 @@ class NodeSetValidatorTracker:
         batch_size = 100
         performance_results = {}
         api_call_count = 0
-        
+
         for i in range(0, len(pubkeys), batch_size):
             print(f"Fetching range {i} to {i + batch_size}...")
             batch = pubkeys[i:i + batch_size]
@@ -494,7 +506,7 @@ class NodeSetValidatorTracker:
                     endpoint = f"/api/v1/validator/{','.join(map(str, batch))}/attestationefficiency"
                     beaconchain_conn.request("GET", endpoint)
                     res = beaconchain_conn.getresponse()
-                    
+
                     if res.status == 429:
                         print(f"Rate limit hit after {api_call_count} calls. Backing off for 60 seconds...")
                         logging.warning("Rate limit encountered, backing off for 60 seconds")
@@ -503,17 +515,17 @@ class NodeSetValidatorTracker:
                         time.sleep(60)
                         api_call_count = 0
                         continue
-                    
+
                     if res.status != 200:
                         print(f"HTTP error {res.status} for batch {i} to {i + batch_size}")
                         res.read()
                         res.close()
                         break
-                    
+
                     data = res.read().decode("utf-8")
                     res.close()
                     api_call_count += 1
-                    
+
                     try:
                         parsed = json.loads(data)
                     except json.JSONDecodeError as e:
@@ -529,9 +541,9 @@ class NodeSetValidatorTracker:
                             performance_results[index] = percent
                     else:
                         print(f"Batch failed for range {i} to {i + batch_size}")
-                    
+
                     break
-                    
+
                 except Exception as e:
                     print(f"Error fetching performance for batch from {i} to {i + batch_size}: {e}")
                     break
