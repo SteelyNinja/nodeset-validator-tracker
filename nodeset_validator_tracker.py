@@ -13,6 +13,7 @@ from typing import Dict, List, Tuple, Set, Optional
 from web3 import Web3
 import http.client
 from eth_abi import decode
+import datetime
 
 # Configuration
 logging.basicConfig(
@@ -30,6 +31,7 @@ BEACON_DEPOSIT_EVENT = "0x649bbc62d0e31342afea4e5cd82d4049e7e1ee912fc0889aa79080
 DEPLOYMENT_BLOCK = 22318339
 CHUNK_SIZE = 5000
 CACHE_FILE = "nodeset_validator_tracker_cache.json"
+AGGREGATE_SIGNATURE = "0x252dba42"
 
 # Beacon chain constants
 GENESIS_TIME = 1606824023
@@ -41,9 +43,10 @@ class NodeSetValidatorTracker:
     Tracks NodeSet validators from blockchain deposits through their complete lifecycle.
     """
 
-    def __init__(self, eth_client_url: str, beacon_api_url: Optional[str] = None):
+    def __init__(self, eth_client_url: str, beacon_api_url: Optional[str] = None, etherscan_api_key: Optional[str] = None):
         self.web3 = self._setup_web3(eth_client_url)
         self.beacon_api_url = self._setup_beacon_api(beacon_api_url)
+        self.etherscan_api_key = etherscan_api_key
         self.cache = self._load_cache()
 
     def _setup_web3(self, eth_client_url: str) -> Web3:
@@ -94,7 +97,10 @@ class NodeSetValidatorTracker:
             'total_exited': 0,
             'processed_transactions': [],
             'operator_performance': {},
-            'performance_last_updated': 0
+            'performance_last_updated': 0,
+            'operator_transactions': {},
+            'operator_costs': {},
+            'cost_last_updated': 0
         }
 
     def _save_cache(self) -> None:
@@ -272,6 +278,170 @@ class NodeSetValidatorTracker:
 
         return exited_validators
 
+    def _count_beacon_deposits(self, tx_receipt: dict) -> int:
+        """Count the number of beacon deposit events in a transaction."""
+        deposit_count = 0
+        
+        for log in tx_receipt['logs']:
+            if (log['address'].lower() != BEACON_DEPOSIT_CONTRACT.lower() or
+                len(log['topics']) == 0):
+                continue
+
+            topic_hex = log['topics'][0].hex()
+            if not topic_hex.startswith('0x'):
+                topic_hex = '0x' + topic_hex
+
+            if topic_hex.lower() == BEACON_DEPOSIT_EVENT.lower():
+                deposit_count += 1
+                
+        return deposit_count
+
+    def _fetch_operator_transactions(self, operator_address: str) -> List[dict]:
+        """Fetch all aggregate transactions for a single operator."""
+        if not self.etherscan_api_key:
+            return []
+
+        all_transactions = []
+        page = 1
+        offset = 1000
+
+        while True:
+            params = {
+                'module': 'account',
+                'action': 'txlist',
+                'address': operator_address,
+                'startblock': DEPLOYMENT_BLOCK,
+                'endblock': 99999999,
+                'page': page,
+                'offset': offset,
+                'sort': 'desc',
+                'apikey': self.etherscan_api_key
+            }
+
+            try:
+                response = requests.get('https://api.etherscan.io/api', params=params, timeout=30)
+                if response.status_code != 200:
+                    break
+
+                data = response.json()
+                if data.get('status') == '0':
+                    break
+
+                transactions = data.get('result', [])
+                if not transactions:
+                    break
+
+                aggregate_txs = []
+                for tx in transactions:
+                    input_data = tx.get('input', '')
+                    if (input_data and
+                        len(input_data) >= 10 and
+                        input_data[:10].lower() == AGGREGATE_SIGNATURE.lower()):
+                        
+                        tx_timestamp = int(tx['timeStamp'])
+                        dt = datetime.datetime.fromtimestamp(tx_timestamp)
+                        
+                        gas_used = int(tx['gasUsed'])
+                        gas_price = int(tx['gasPrice'])
+                        txn_fee_wei = gas_used * gas_price
+                        total_cost = float(self.web3.from_wei(txn_fee_wei, 'ether'))
+                        
+                        is_error = int(tx.get('isError', '0'))
+                        status = "Failed" if is_error == 1 else "Successful"
+                        
+                        # Count validators for successful transactions
+                        validator_count = 0
+                        if status == "Successful":
+                            try:
+                                tx_receipt = self.web3.eth.get_transaction_receipt(tx['hash'])
+                                validator_count = self._count_beacon_deposits(tx_receipt)
+                            except Exception as e:
+                                logging.debug("Error counting deposits for tx %s: %s", tx['hash'], str(e))
+                                validator_count = 0
+                        
+                        aggregate_txs.append({
+                            'hash': tx['hash'],
+                            'date': dt.strftime("%Y-%m-%d"),
+                            'time': dt.strftime("%H:%M:%S"),
+                            'gas_used': gas_used,
+                            'gas_price': gas_price,
+                            'total_cost_eth': total_cost,
+                            'status': status,
+                            'validator_count': validator_count
+                        })
+
+                all_transactions.extend(aggregate_txs)
+
+                if len(transactions) < offset:
+                    break
+
+                page += 1
+                time.sleep(0.2)
+
+            except Exception as e:
+                logging.debug("Error fetching transactions for %s page %d: %s", operator_address[:10], page, str(e))
+                break
+
+        return all_transactions
+
+    def analyze_operator_costs(self) -> None:
+        """Analyze transaction costs for all operators."""
+        if not self.etherscan_api_key:
+            logging.info("Etherscan API key not provided, skipping cost analysis")
+            return
+
+        operator_validators = self.cache.get('operator_validators', {})
+        operator_transactions = self.cache.get('operator_transactions', {})
+        operator_costs = self.cache.get('operator_costs', {})
+        
+        last_cost_update = self.cache.get('cost_last_updated', 0)
+        current_time = int(time.time())
+        
+        if current_time - last_cost_update < 3600:
+            logging.info("Cost data updated recently, skipping")
+            return
+
+        print(f"Analyzing transaction costs for {len(operator_validators)} operators")
+        
+        for i, operator in enumerate(operator_validators.keys()):
+            print(f"Fetching costs for operator {i+1}/{len(operator_validators)}: {operator[:10]}...")
+            
+            transactions = self._fetch_operator_transactions(operator)
+            
+            if transactions:
+                operator_transactions[operator] = transactions
+                
+                total_cost = sum(tx['total_cost_eth'] for tx in transactions)
+                successful_txs = len([tx for tx in transactions if tx['status'] == 'Successful'])
+                failed_txs = len([tx for tx in transactions if tx['status'] == 'Failed'])
+                avg_cost = total_cost / len(transactions) if transactions else 0
+                total_validators_created = sum(tx['validator_count'] for tx in transactions if tx['status'] == 'Successful')
+                
+                operator_costs[operator] = {
+                    'total_cost_eth': total_cost,
+                    'successful_txs': successful_txs,
+                    'failed_txs': failed_txs,
+                    'avg_cost_per_tx': avg_cost,
+                    'total_txs': len(transactions),
+                    'total_validators_created': total_validators_created
+                }
+                
+                logging.info("Operator %s: %d transactions, %.6f ETH total cost, %d validators", 
+                           operator[:10], len(transactions), total_cost, total_validators_created)
+            
+            time.sleep(0.3)
+
+        self.cache.update({
+            'operator_transactions': operator_transactions,
+            'operator_costs': operator_costs,
+            'cost_last_updated': current_time
+        })
+        
+        total_operators_with_costs = len([c for c in operator_costs.values() if c['total_txs'] > 0])
+        total_cost_all = sum(c['total_cost_eth'] for c in operator_costs.values())
+        total_validators_all = sum(c['total_validators_created'] for c in operator_costs.values())
+        print(f"Cost analysis complete: {total_operators_with_costs} operators, {total_cost_all:.6f} ETH total, {total_validators_all} validators")
+
     def scan_validators(self) -> Tuple[dict, int]:
         """Scan blockchain for NodeSet validator deposits."""
         start_block = max(self.cache['last_block'] + 1, DEPLOYMENT_BLOCK)
@@ -405,7 +575,7 @@ class NodeSetValidatorTracker:
 
                     if (i + 1) % 50 == 0:
                         print(f"Processed {i + 1}/{len(processed_txs)}: {len(validator_indices)} indices, {len(pending_pubkeys)} pending")
-                        logging.info("Extraction progress: %d/%d transactions processed, %d indices mapped, %d pending", 
+                        logging.info("Extraction progress: %d/%d transactions processed, %d indices mapped, %d pending",
                                     i + 1, len(processed_txs), len(validator_indices), len(pending_pubkeys))
 
                 except Exception as e:
@@ -413,7 +583,7 @@ class NodeSetValidatorTracker:
                     continue
 
             print(f"Extraction complete: {len(validator_indices)} indices, {len(pending_pubkeys)} pending")
-            logging.info("Validator extraction completed: %d total indices mapped, %d pending activation", 
+            logging.info("Validator extraction completed: %d total indices mapped, %d pending activation",
                         len(validator_indices), len(pending_pubkeys))
 
         # Check pending activations
@@ -651,12 +821,35 @@ class NodeSetValidatorTracker:
             percent_str = f"{percent:.2f}%" if percent is not None else "N/A"
             print(f"Operator: {operator}, Efficiency: {percent_str}")
 
+        # Cost analysis summary
+        operator_costs = self.cache.get('operator_costs', {})
+        if operator_costs:
+            print("\n=== COST ANALYSIS SUMMARY ===")
+            total_cost = sum(cost['total_cost_eth'] for cost in operator_costs.values())
+            total_txs = sum(cost['total_txs'] for cost in operator_costs.values())
+            total_validators_created = sum(cost['total_validators_created'] for cost in operator_costs.values())
+            operators_with_costs = len([c for c in operator_costs.values() if c['total_txs'] > 0])
+            
+            print(f"Total gas spent: {total_cost:.6f} ETH")
+            print(f"Total transactions: {total_txs}")
+            print(f"Total validators created: {total_validators_created}")
+            print(f"Operators with transaction data: {operators_with_costs}")
+            
+            if total_txs > 0:
+                avg_cost_per_tx = total_cost / total_txs
+                print(f"Average cost per transaction: {avg_cost_per_tx:.6f} ETH")
+            
+            if total_validators_created > 0:
+                avg_cost_per_validator = total_cost / total_validators_created
+                print(f"Average cost per validator: {avg_cost_per_validator:.6f} ETH")
+
     def run_analysis(self) -> None:
         """Execute complete validator analysis."""
         try:
             print("NodeSet Validator Tracker")
             print(f"Ethereum node: Connected")
             print(f"Beacon API: {'Connected' if self.beacon_api_url else 'Disabled'}")
+            print(f"Etherscan API: {'Enabled' if self.etherscan_api_key else 'Disabled'}")
 
             # Scan for validators
             operator_validators, total_validators = self.scan_validators()
@@ -672,6 +865,12 @@ class NodeSetValidatorTracker:
             print(f"\nChecking performance for {total_validators} validators")
             operator_performance = self.check_performance()
             self._save_cache()
+
+            # Analyze transaction costs
+            if self.etherscan_api_key:
+                print(f"\nAnalyzing transaction costs")
+                self.analyze_operator_costs()
+                self._save_cache()
 
             # Generate report
             self.generate_report(operator_validators, operator_exited,
@@ -691,8 +890,9 @@ def main():
         raise ValueError("ETH_CLIENT_URL environment variable is required")
 
     beacon_api_url = os.getenv('BEACON_API_URL')
+    etherscan_api_key = os.getenv('ETHERSCAN_API_KEY')
 
-    tracker = NodeSetValidatorTracker(eth_client_url, beacon_api_url)
+    tracker = NodeSetValidatorTracker(eth_client_url, beacon_api_url, etherscan_api_key)
     tracker.run_analysis()
 
 
