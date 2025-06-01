@@ -1,5 +1,5 @@
 """
-NodeSet Validator Tracker
+NodeSet Validator Tracker with ENS Support
 
 """
 
@@ -38,9 +38,13 @@ GENESIS_TIME = 1606824023
 SECONDS_PER_SLOT = 12
 SLOTS_PER_EPOCH = 32
 
+# ENS constants
+ENS_UPDATE_INTERVAL = 3600  # 1 hour in seconds
+
 class NodeSetValidatorTracker:
     """
     Tracks NodeSet validators from blockchain deposits through their complete lifecycle.
+    Now includes ENS name resolution and caching.
     """
 
     def __init__(self, eth_client_url: str, beacon_api_url: Optional[str] = None, etherscan_api_key: Optional[str] = None):
@@ -100,7 +104,11 @@ class NodeSetValidatorTracker:
             'performance_last_updated': 0,
             'operator_transactions': {},
             'operator_costs': {},
-            'cost_last_updated': 0
+            'cost_last_updated': 0,
+            # ENS-related cache entries
+            'ens_names': {},
+            'ens_last_updated': 0,
+            'ens_update_failures': {}
         }
 
     def _save_cache(self) -> None:
@@ -108,10 +116,119 @@ class NodeSetValidatorTracker:
         try:
             with open(CACHE_FILE, 'w') as f:
                 json.dump(self.cache, f, indent=2)
-            logging.info("Cache saved: %d active validators, %d exited",
-                        self.cache.get('total_validators', 0), self.cache.get('total_exited', 0))
+            logging.info("Cache saved: %d active validators, %d exited, %d ENS names",
+                        self.cache.get('total_validators', 0), 
+                        self.cache.get('total_exited', 0),
+                        len(self.cache.get('ens_names', {})))
         except Exception as e:
             logging.error("Error saving cache: %s", str(e))
+
+    def _resolve_ens_name(self, address: str) -> Optional[str]:
+        """Resolve ENS name for an Ethereum address using Web3."""
+        try:
+            # Normalize address
+            checksum_address = self.web3.to_checksum_address(address.lower())
+            
+            # Try to resolve ENS name
+            ens_name = self.web3.ens.name(checksum_address)
+            
+            if ens_name:
+                logging.info("Resolved ENS: %s -> %s", address[:10], ens_name)
+                return ens_name
+            else:
+                logging.debug("No ENS name found for %s", address[:10])
+                return None
+                
+        except Exception as e:
+            logging.debug("ENS resolution failed for %s: %s", address[:10], str(e))
+            return None
+
+    def _update_ens_names(self) -> None:
+        """Update ENS names for all operator addresses."""
+        current_time = int(time.time())
+        last_ens_update = self.cache.get('ens_last_updated', 0)
+        
+        # Check if we need to update (every hour)
+        if current_time - last_ens_update < ENS_UPDATE_INTERVAL:
+            time_until_next = ENS_UPDATE_INTERVAL - (current_time - last_ens_update)
+            logging.info("ENS update not due yet. Next update in %d minutes", time_until_next // 60)
+            return
+
+        operator_validators = self.cache.get('operator_validators', {})
+        ens_names = self.cache.get('ens_names', {})
+        ens_failures = self.cache.get('ens_update_failures', {})
+        
+        operator_addresses = list(operator_validators.keys())
+        
+        if not operator_addresses:
+            logging.info("No operator addresses to resolve ENS names for")
+            return
+            
+        print(f"Updating ENS names for {len(operator_addresses)} operators...")
+        logging.info("Starting ENS resolution for %d operator addresses", len(operator_addresses))
+        
+        updated_count = 0
+        failed_count = 0
+        
+        for i, address in enumerate(operator_addresses):
+            try:
+                # Skip if we recently failed to resolve this address (avoid repeated failures)
+                if address in ens_failures:
+                    last_failure = ens_failures[address]
+                    if current_time - last_failure < 86400:  # Skip for 24 hours after failure
+                        continue
+                
+                print(f"Resolving ENS for operator {i+1}/{len(operator_addresses)}: {address[:10]}...")
+                
+                ens_name = self._resolve_ens_name(address)
+                
+                if ens_name:
+                    ens_names[address] = ens_name
+                    updated_count += 1
+                    # Remove from failures if previously failed
+                    if address in ens_failures:
+                        del ens_failures[address]
+                else:
+                    # Mark as failed to avoid repeated lookups
+                    ens_failures[address] = current_time
+                    failed_count += 1
+                
+                # Rate limiting - be respectful to the node
+                time.sleep(0.1)
+                
+                # Progress update every 10 addresses
+                if (i + 1) % 10 == 0:
+                    print(f"Progress: {i+1}/{len(operator_addresses)} ({updated_count} found)")
+                    
+            except Exception as e:
+                logging.error("Error resolving ENS for %s: %s", address[:10], str(e))
+                ens_failures[address] = current_time
+                failed_count += 1
+                continue
+        
+        # Update cache
+        self.cache.update({
+            'ens_names': ens_names,
+            'ens_last_updated': current_time,
+            'ens_update_failures': ens_failures
+        })
+        
+        print(f"ENS update complete: {updated_count} names found, {failed_count} failed")
+        logging.info("ENS update completed: %d names resolved, %d failed, %d total cached", 
+                    updated_count, failed_count, len(ens_names))
+
+    def get_ens_name(self, address: str) -> Optional[str]:
+        """Get ENS name for an address from cache."""
+        ens_names = self.cache.get('ens_names', {})
+        return ens_names.get(address)
+
+    def format_operator_display(self, address: str) -> str:
+        """Format operator address with ENS name if available."""
+        ens_name = self.get_ens_name(address)
+        if ens_name:
+            return f"{ens_name} ({address[:8]}...{address[-6:]})"
+        else:
+            return f"{address[:8]}...{address[-6:]}"
 
     def _extract_pubkeys_from_deposit(self, tx_receipt: dict) -> List[str]:
         """Extract validator public keys from beacon deposit events."""
@@ -281,7 +398,7 @@ class NodeSetValidatorTracker:
     def _count_beacon_deposits(self, tx_receipt: dict) -> int:
         """Count the number of beacon deposit events in a transaction."""
         deposit_count = 0
-        
+
         for log in tx_receipt['logs']:
             if (log['address'].lower() != BEACON_DEPOSIT_CONTRACT.lower() or
                 len(log['topics']) == 0):
@@ -293,7 +410,7 @@ class NodeSetValidatorTracker:
 
             if topic_hex.lower() == BEACON_DEPOSIT_EVENT.lower():
                 deposit_count += 1
-                
+
         return deposit_count
 
     def _fetch_operator_transactions(self, operator_address: str) -> List[dict]:
@@ -337,18 +454,18 @@ class NodeSetValidatorTracker:
                     if (input_data and
                         len(input_data) >= 10 and
                         input_data[:10].lower() == AGGREGATE_SIGNATURE.lower()):
-                        
+
                         tx_timestamp = int(tx['timeStamp'])
                         dt = datetime.datetime.fromtimestamp(tx_timestamp)
-                        
+
                         gas_used = int(tx['gasUsed'])
                         gas_price = int(tx['gasPrice'])
                         txn_fee_wei = gas_used * gas_price
                         total_cost = float(self.web3.from_wei(txn_fee_wei, 'ether'))
-                        
+
                         is_error = int(tx.get('isError', '0'))
                         status = "Failed" if is_error == 1 else "Successful"
-                        
+
                         # Count validators for successful transactions
                         validator_count = 0
                         if status == "Successful":
@@ -358,7 +475,7 @@ class NodeSetValidatorTracker:
                             except Exception as e:
                                 logging.debug("Error counting deposits for tx %s: %s", tx['hash'], str(e))
                                 validator_count = 0
-                        
+
                         aggregate_txs.append({
                             'hash': tx['hash'],
                             'date': dt.strftime("%Y-%m-%d"),
@@ -393,30 +510,31 @@ class NodeSetValidatorTracker:
         operator_validators = self.cache.get('operator_validators', {})
         operator_transactions = self.cache.get('operator_transactions', {})
         operator_costs = self.cache.get('operator_costs', {})
-        
+
         last_cost_update = self.cache.get('cost_last_updated', 0)
         current_time = int(time.time())
-        
+
         if current_time - last_cost_update < 3600:
             logging.info("Cost data updated recently, skipping")
             return
 
         print(f"Analyzing transaction costs for {len(operator_validators)} operators")
-        
+
         for i, operator in enumerate(operator_validators.keys()):
-            print(f"Fetching costs for operator {i+1}/{len(operator_validators)}: {operator[:10]}...")
-            
+            display_name = self.format_operator_display(operator)
+            print(f"Fetching costs for operator {i+1}/{len(operator_validators)}: {display_name}...")
+
             transactions = self._fetch_operator_transactions(operator)
-            
+
             if transactions:
                 operator_transactions[operator] = transactions
-                
+
                 total_cost = sum(tx['total_cost_eth'] for tx in transactions)
                 successful_txs = len([tx for tx in transactions if tx['status'] == 'Successful'])
                 failed_txs = len([tx for tx in transactions if tx['status'] == 'Failed'])
                 avg_cost = total_cost / len(transactions) if transactions else 0
                 total_validators_created = sum(tx['validator_count'] for tx in transactions if tx['status'] == 'Successful')
-                
+
                 operator_costs[operator] = {
                     'total_cost_eth': total_cost,
                     'successful_txs': successful_txs,
@@ -425,10 +543,10 @@ class NodeSetValidatorTracker:
                     'total_txs': len(transactions),
                     'total_validators_created': total_validators_created
                 }
-                
-                logging.info("Operator %s: %d transactions, %.6f ETH total cost, %d validators", 
-                           operator[:10], len(transactions), total_cost, total_validators_created)
-            
+
+                logging.info("Operator %s: %d transactions, %.6f ETH total cost, %d validators",
+                           display_name, len(transactions), total_cost, total_validators_created)
+
             time.sleep(0.3)
 
         self.cache.update({
@@ -436,7 +554,7 @@ class NodeSetValidatorTracker:
             'operator_costs': operator_costs,
             'cost_last_updated': current_time
         })
-        
+
         total_operators_with_costs = len([c for c in operator_costs.values() if c['total_txs'] > 0])
         total_cost_all = sum(c['total_cost_eth'] for c in operator_costs.values())
         total_validators_all = sum(c['total_validators_created'] for c in operator_costs.values())
@@ -629,7 +747,8 @@ class NodeSetValidatorTracker:
                                 operator_exited[operator] += 1
                                 new_exits += 1
                                 exited_pubkeys.add(pubkey)
-                                print(f"Exit: Validator {index} ({operator[:10]}...) - {status}")
+                                display_name = self.format_operator_display(operator)
+                                print(f"Exit: Validator {index} ({display_name}) - {status}")
                                 break
 
                 self.cache['exited_pubkeys'] = list(exited_pubkeys)
@@ -742,7 +861,7 @@ class NodeSetValidatorTracker:
 
     def generate_report(self, operator_validators: dict, operator_exited: dict,
                        total_validators: int, total_exited: int, operator_performance: dict) -> None:
-        """Generate comprehensive validator status report."""
+        """Generate comprehensive validator status report with ENS names."""
 
         # Calculate active validators per operator
         active_per_operator = {}
@@ -785,7 +904,7 @@ class NodeSetValidatorTracker:
                 operator_count = exit_counts[exit_count]
                 print(f"Operators with {exit_count} exits: {operator_count}")
 
-        # Top operators
+        # Top operators with ENS names
         print("\n=== TOP OPERATORS ===")
         operator_list = [(addr, count) for addr, count in active_per_operator.items()]
         operator_list.sort(key=lambda x: x[1], reverse=True)
@@ -793,10 +912,12 @@ class NodeSetValidatorTracker:
         for addr, active_count in operator_list[:5]:
             exited_count = operator_exited.get(addr, 0)
             total_ever = operator_validators.get(addr, 0)
+            display_name = self.format_operator_display(addr)
+            
             if exited_count > 0:
-                print(f"{active_count} active ({total_ever} total, {exited_count} exited): {addr}")
+                print(f"{active_count} active ({total_ever} total, {exited_count} exited): {display_name}")
             else:
-                print(f"{active_count} validators: {addr}")
+                print(f"{active_count} validators: {display_name}")
 
         # Fully exited operators
         fully_exited = [(op, cnt) for op, cnt in operator_validators.items()
@@ -805,21 +926,24 @@ class NodeSetValidatorTracker:
         if fully_exited:
             print("\n=== FULLY EXITED OPERATORS ===")
             for operator, count in fully_exited:
-                print(f"All {count} validators exited: {operator}")
+                display_name = self.format_operator_display(operator)
+                print(f"All {count} validators exited: {display_name}")
 
         # Worst attestation performance
         print("\n=== WORST ATTESTATION PERFORMANCE ===")
         sorted_operator_performance = sorted(operator_performance, key=lambda x: (x[1] is None, x[1]))
         for operator, percent in list(reversed(sorted_operator_performance[:5])):
+            display_name = self.format_operator_display(operator)
             percent_str = f"{percent}%" if percent is not None else "N/A"
-            print(f"Operator: {operator}, Efficiency: {percent_str}")
+            print(f"Operator: {display_name}, Efficiency: {percent_str}")
 
         # Best attestation performance
         print("\n=== BEST ATTESTATION PERFORMANCE ===")
         sorted_operator_performance = sorted(operator_performance, key=lambda x: (x[1] is None, -x[1] if x[1] is not None else float('inf')))
         for operator, percent in sorted_operator_performance[:5]:
+            display_name = self.format_operator_display(operator)
             percent_str = f"{percent:.2f}%" if percent is not None else "N/A"
-            print(f"Operator: {operator}, Efficiency: {percent_str}")
+            print(f"Operator: {display_name}, Efficiency: {percent_str}")
 
         # Cost analysis summary
         operator_costs = self.cache.get('operator_costs', {})
@@ -829,30 +953,51 @@ class NodeSetValidatorTracker:
             total_txs = sum(cost['total_txs'] for cost in operator_costs.values())
             total_validators_created = sum(cost['total_validators_created'] for cost in operator_costs.values())
             operators_with_costs = len([c for c in operator_costs.values() if c['total_txs'] > 0])
-            
+
             print(f"Total gas spent: {total_cost:.6f} ETH")
             print(f"Total transactions: {total_txs}")
             print(f"Total validators created: {total_validators_created}")
             print(f"Operators with transaction data: {operators_with_costs}")
-            
+
             if total_txs > 0:
                 avg_cost_per_tx = total_cost / total_txs
                 print(f"Average cost per transaction: {avg_cost_per_tx:.6f} ETH")
-            
+
             if total_validators_created > 0:
                 avg_cost_per_validator = total_cost / total_validators_created
                 print(f"Average cost per validator: {avg_cost_per_validator:.6f} ETH")
 
+        # ENS Summary
+        ens_names = self.cache.get('ens_names', {})
+        if ens_names:
+            print(f"\n=== ENS NAMES RESOLVED ===")
+            print(f"Total ENS names found: {len(ens_names)}")
+            print(f"ENS coverage: {len(ens_names)}/{len(operator_validators)} operators ({len(ens_names)/len(operator_validators)*100:.1f}%)")
+            
+            # Show operators with ENS names
+            ens_operators = [(addr, name) for addr, name in ens_names.items() if addr in operator_validators]
+            if ens_operators:
+                print("\nOperators with ENS names:")
+                for addr, name in sorted(ens_operators, key=lambda x: operator_validators.get(x[0], 0), reverse=True)[:10]:
+                    validator_count = operator_validators.get(addr, 0)
+                    print(f"  {name} ({addr[:8]}...{addr[-6:]}): {validator_count} validators")
+
     def run_analysis(self) -> None:
-        """Execute complete validator analysis."""
+        """Execute complete validator analysis with ENS resolution."""
         try:
-            print("NodeSet Validator Tracker")
+            print("NodeSet Validator Tracker with ENS Support")
             print(f"Ethereum node: Connected")
             print(f"Beacon API: {'Connected' if self.beacon_api_url else 'Disabled'}")
             print(f"Etherscan API: {'Enabled' if self.etherscan_api_key else 'Disabled'}")
 
             # Scan for validators
             operator_validators, total_validators = self.scan_validators()
+
+            # Update ENS names (runs every hour)
+            if operator_validators:
+                print(f"\nUpdating ENS names for {len(operator_validators)} operators")
+                self._update_ens_names()
+                self._save_cache()
 
             # Track exits if beacon API available
             operator_exited, total_exited = {}, 0
