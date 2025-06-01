@@ -1,5 +1,5 @@
 """
-NodeSet Validator Tracker with ENS Support
+NodeSet Validator Tracker with ENS Support and Manual Override
 
 """
 
@@ -31,6 +31,7 @@ BEACON_DEPOSIT_EVENT = "0x649bbc62d0e31342afea4e5cd82d4049e7e1ee912fc0889aa79080
 DEPLOYMENT_BLOCK = 22318339
 CHUNK_SIZE = 5000
 CACHE_FILE = "nodeset_validator_tracker_cache.json"
+MANUAL_ENS_FILE = "manual_ens_names.json"
 AGGREGATE_SIGNATURE = "0x252dba42"
 
 # Beacon chain constants
@@ -44,13 +45,14 @@ ENS_UPDATE_INTERVAL = 3600  # 1 hour in seconds
 class NodeSetValidatorTracker:
     """
     Tracks NodeSet validators from blockchain deposits through their complete lifecycle.
-    Now includes ENS name resolution and caching.
+    Now includes ENS name resolution, caching, and manual ENS override support.
     """
 
     def __init__(self, eth_client_url: str, beacon_api_url: Optional[str] = None, etherscan_api_key: Optional[str] = None):
         self.web3 = self._setup_web3(eth_client_url)
         self.beacon_api_url = self._setup_beacon_api(beacon_api_url)
         self.etherscan_api_key = etherscan_api_key
+        self.manual_ens_names = self._load_manual_ens_names()
         self.cache = self._load_cache()
 
     def _setup_web3(self, eth_client_url: str) -> Web3:
@@ -76,6 +78,44 @@ class NodeSetValidatorTracker:
             logging.warning("Beacon API connection failed: %s", str(e))
 
         return beacon_api_url
+
+    def _load_manual_ens_names(self) -> Dict[str, str]:
+        """Load manual ENS name mappings from JSON file."""
+        if os.path.exists(MANUAL_ENS_FILE):
+            try:
+                with open(MANUAL_ENS_FILE, 'r') as f:
+                    manual_names = json.load(f)
+                    
+                normalized_names = {}
+                for address, name in manual_names.items():
+                    normalized_address = address.lower()
+                    normalized_names[normalized_address] = name
+                    
+                logging.info("Loaded %d manual ENS name mappings from %s", 
+                           len(normalized_names), MANUAL_ENS_FILE)
+                return normalized_names
+            except Exception as e:
+                logging.warning("Error loading manual ENS names from %s: %s", MANUAL_ENS_FILE, str(e))
+                return {}
+        else:
+            self._create_example_manual_ens_file()
+            logging.info("Created example manual ENS file: %s", MANUAL_ENS_FILE)
+            return {}
+
+    def _create_example_manual_ens_file(self) -> None:
+        """Create an example manual ENS names file."""
+        example_data = {
+            "0x57e67C5C943c3444f7D9bC3b427c619398BFd45a": "vapor.farm",
+            "0x1234567890123456789012345678901234567890": "example.operator"
+        }
+        
+        try:
+            with open(MANUAL_ENS_FILE, 'w') as f:
+                json.dump(example_data, f, indent=2)
+            print(f"Created example manual ENS file: {MANUAL_ENS_FILE}")
+            print("Add your custom address-to-name mappings to this file.")
+        except Exception as e:
+            logging.error("Error creating example manual ENS file: %s", str(e))
 
     def _load_cache(self) -> dict:
         """Load cached analysis state."""
@@ -117,105 +157,105 @@ class NodeSetValidatorTracker:
             with open(CACHE_FILE, 'w') as f:
                 json.dump(self.cache, f, indent=2)
             logging.info("Cache saved: %d active validators, %d exited, %d ENS names",
-                        self.cache.get('total_validators', 0), 
+                        self.cache.get('total_validators', 0),
                         self.cache.get('total_exited', 0),
                         len(self.cache.get('ens_names', {})))
         except Exception as e:
             logging.error("Error saving cache: %s", str(e))
 
     def _resolve_ens_name(self, address: str) -> Optional[str]:
-        """Resolve ENS name for an Ethereum address using Web3."""
+        """Resolve ENS name for an Ethereum address, checking manual override first."""
+        normalized_address = address.lower()
+        if normalized_address in self.manual_ens_names:
+            manual_name = self.manual_ens_names[normalized_address]
+            logging.info("Using manual ENS name: %s -> %s", address[:10], manual_name)
+            return manual_name
+
         try:
-            # Normalize address
             checksum_address = self.web3.to_checksum_address(address.lower())
-            
-            # Try to resolve ENS name
             ens_name = self.web3.ens.name(checksum_address)
-            
+
             if ens_name:
-                logging.info("Resolved ENS: %s -> %s", address[:10], ens_name)
+                logging.info("Resolved on-chain ENS: %s -> %s", address[:10], ens_name)
                 return ens_name
             else:
-                logging.debug("No ENS name found for %s", address[:10])
+                logging.debug("No on-chain ENS name found for %s", address[:10])
                 return None
-                
+
         except Exception as e:
-            logging.debug("ENS resolution failed for %s: %s", address[:10], str(e))
+            logging.debug("On-chain ENS resolution failed for %s: %s", address[:10], str(e))
             return None
 
     def _update_ens_names(self) -> None:
         """Update ENS names for all operator addresses."""
         current_time = int(time.time())
         last_ens_update = self.cache.get('ens_last_updated', 0)
-        
-        # Check if we need to update (every hour)
-        if current_time - last_ens_update < ENS_UPDATE_INTERVAL:
-            time_until_next = ENS_UPDATE_INTERVAL - (current_time - last_ens_update)
-            logging.info("ENS update not due yet. Next update in %d minutes", time_until_next // 60)
-            return
 
         operator_validators = self.cache.get('operator_validators', {})
         ens_names = self.cache.get('ens_names', {})
         ens_failures = self.cache.get('ens_update_failures', {})
-        
+
         operator_addresses = list(operator_validators.keys())
-        
+
         if not operator_addresses:
             logging.info("No operator addresses to resolve ENS names for")
             return
-            
+
         print(f"Updating ENS names for {len(operator_addresses)} operators...")
-        logging.info("Starting ENS resolution for %d operator addresses", len(operator_addresses))
-        
+        print(f"Manual ENS mappings available: {len(self.manual_ens_names)}")
+        logging.info("Starting ENS resolution for %d operator addresses (%d manual mappings loaded)", 
+                    len(operator_addresses), len(self.manual_ens_names))
+
         updated_count = 0
+        manual_count = 0
         failed_count = 0
-        
+
         for i, address in enumerate(operator_addresses):
             try:
-                # Skip if we recently failed to resolve this address (avoid repeated failures)
-                if address in ens_failures:
-                    last_failure = ens_failures[address]
-                    if current_time - last_failure < 86400:  # Skip for 24 hours after failure
-                        continue
-                
+                normalized_address = address.lower()
                 print(f"Resolving ENS for operator {i+1}/{len(operator_addresses)}: {address[:10]}...")
-                
+
                 ens_name = self._resolve_ens_name(address)
-                
+
                 if ens_name:
                     ens_names[address] = ens_name
                     updated_count += 1
-                    # Remove from failures if previously failed
+                    
+                    if normalized_address in self.manual_ens_names:
+                        manual_count += 1
+                    
                     if address in ens_failures:
                         del ens_failures[address]
                 else:
-                    # Mark as failed to avoid repeated lookups
-                    ens_failures[address] = current_time
+                    if normalized_address not in self.manual_ens_names:
+                        ens_failures[address] = current_time
                     failed_count += 1
-                
-                # Rate limiting - be respectful to the node
-                time.sleep(0.1)
-                
+
+                if normalized_address not in self.manual_ens_names:
+                    time.sleep(0.1)
+
                 # Progress update every 10 addresses
                 if (i + 1) % 10 == 0:
-                    print(f"Progress: {i+1}/{len(operator_addresses)} ({updated_count} found)")
-                    
+                    print(f"Progress: {i+1}/{len(operator_addresses)} ({updated_count} found, {manual_count} manual)")
+
             except Exception as e:
                 logging.error("Error resolving ENS for %s: %s", address[:10], str(e))
-                ens_failures[address] = current_time
+                normalized_address = address.lower()
+                if normalized_address not in self.manual_ens_names:
+                    ens_failures[address] = current_time
                 failed_count += 1
                 continue
-        
+
         # Update cache
         self.cache.update({
             'ens_names': ens_names,
             'ens_last_updated': current_time,
             'ens_update_failures': ens_failures
         })
-        
-        print(f"ENS update complete: {updated_count} names found, {failed_count} failed")
-        logging.info("ENS update completed: %d names resolved, %d failed, %d total cached", 
-                    updated_count, failed_count, len(ens_names))
+
+        print(f"ENS update complete: {updated_count} names found ({manual_count} manual, {updated_count - manual_count} on-chain), {failed_count} failed")
+        logging.info("ENS update completed: %d names resolved (%d manual, %d on-chain), %d failed, %d total cached",
+                    updated_count, manual_count, updated_count - manual_count, failed_count, len(ens_names))
 
     def get_ens_name(self, address: str) -> Optional[str]:
         """Get ENS name for an address from cache."""
@@ -913,7 +953,7 @@ class NodeSetValidatorTracker:
             exited_count = operator_exited.get(addr, 0)
             total_ever = operator_validators.get(addr, 0)
             display_name = self.format_operator_display(addr)
-            
+
             if exited_count > 0:
                 print(f"{active_count} active ({total_ever} total, {exited_count} exited): {display_name}")
             else:
@@ -972,23 +1012,27 @@ class NodeSetValidatorTracker:
         if ens_names:
             print(f"\n=== ENS NAMES RESOLVED ===")
             print(f"Total ENS names found: {len(ens_names)}")
+            print(f"Manual ENS mappings loaded: {len(self.manual_ens_names)}")
             print(f"ENS coverage: {len(ens_names)}/{len(operator_validators)} operators ({len(ens_names)/len(operator_validators)*100:.1f}%)")
-            
+
             # Show operators with ENS names
             ens_operators = [(addr, name) for addr, name in ens_names.items() if addr in operator_validators]
             if ens_operators:
                 print("\nOperators with ENS names:")
                 for addr, name in sorted(ens_operators, key=lambda x: operator_validators.get(x[0], 0), reverse=True)[:10]:
                     validator_count = operator_validators.get(addr, 0)
-                    print(f"  {name} ({addr[:8]}...{addr[-6:]}): {validator_count} validators")
+                    is_manual = addr.lower() in self.manual_ens_names
+                    source = " (manual)" if is_manual else " (on-chain)"
+                    print(f"  {name}{source} ({addr[:8]}...{addr[-6:]}): {validator_count} validators")
 
     def run_analysis(self) -> None:
         """Execute complete validator analysis with ENS resolution."""
         try:
-            print("NodeSet Validator Tracker with ENS Support")
+            print("NodeSet Validator Tracker with ENS Support and Manual Override")
             print(f"Ethereum node: Connected")
             print(f"Beacon API: {'Connected' if self.beacon_api_url else 'Disabled'}")
             print(f"Etherscan API: {'Enabled' if self.etherscan_api_key else 'Disabled'}")
+            print(f"Manual ENS file: {MANUAL_ENS_FILE} ({len(self.manual_ens_names)} mappings loaded)")
 
             # Scan for validators
             operator_validators, total_validators = self.scan_validators()
