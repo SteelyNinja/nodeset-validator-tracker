@@ -72,6 +72,11 @@ Maximum operator concentration: 0.0101
 - **Performance issues**: Use local clients for best performance
 - **Exit tracking disabled**: Check beacon API connectivity
 
+## Additional Scripts
+
+- **proposal_tracker.py**: analyse proposals by nodeset validators - requires json from main script
+- **standalone_mev_analyzer.py**: query mev endpoints for registered gas - requires json from main script
+
 Logs are written to `nodeset_validator_tracker.log` for detailed debugging.
 
 ## License
