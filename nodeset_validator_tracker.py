@@ -816,6 +816,21 @@ class NodeSetValidatorTracker:
 
     def check_performance(self):
         """Check validator attestation performance and store in cache."""
+        # Check if performance was updated recently (6 hours = 21600 seconds)
+        last_performance_update = self.cache.get('performance_last_updated', 0)
+        current_time = int(time.time())
+        
+        if current_time - last_performance_update < 21600:  # 6 hours
+            hours_since_update = (current_time - last_performance_update) // 3600
+            logging.info("Performance data updated recently (%d hours ago), skipping", hours_since_update)
+            print(f"Performance data updated {hours_since_update} hours ago, skipping API calls")
+            # Return existing performance data from cache
+            return list(self.cache.get('operator_performance', {}).items())
+        
+        print("Performance data is stale (>6 hours), fetching fresh data from beaconcha.in...")
+        logging.info("Starting performance check - last update was %d hours ago", 
+                    (current_time - last_performance_update) // 3600)
+        
         beaconchain_conn = http.client.HTTPSConnection("beaconcha.in")
         validator_indices = dict(self.cache.get('validator_indices', {}))
         exited_pubkeys = set(self.cache.get('exited_pubkeys', []))
@@ -895,7 +910,10 @@ class NodeSetValidatorTracker:
                 results.append((operator, total / count))
 
         self.cache['operator_performance'] = dict(results)
-        self.cache['performance_last_updated'] = int(time.time())
+        self.cache['performance_last_updated'] = current_time
+        
+        print(f"Performance data updated successfully for {len(results)} operators")
+        logging.info("Performance check completed: %d operators updated", len(results))
 
         return results
 
