@@ -816,11 +816,11 @@ class NodeSetValidatorTracker:
 
     def check_performance(self):
         """Check validator attestation performance and store in cache."""
-        # Check if performance was updated recently (6 hours = 21600 seconds)
+        # Check if performance was updated recently (3 hours = 10800 seconds)
         last_performance_update = self.cache.get('performance_last_updated', 0)
         current_time = int(time.time())
         
-        if current_time - last_performance_update < 21600:  # 6 hours
+        if current_time - last_performance_update < 10800:  # 3 hours
             hours_since_update = (current_time - last_performance_update) // 3600
             logging.info("Performance data updated recently (%d hours ago), skipping", hours_since_update)
             print(f"Performance data updated {hours_since_update} hours ago, skipping API calls")
