@@ -1,11 +1,12 @@
 """
-NodeSet Block Proposal Tracker - Comprehensive Version
-Combines local clients with external APIs for complete reward tracking
+NodeSet Block Proposal Tracker - Comprehensive Version with Graffiti Analysis
+Combines local clients with external APIs for complete reward tracking and consensus client detection
 
 Data Sources:
 1. Local: Lighthouse beacon + pruned execution client
 2. External: Beaconcha.in API for execution/MEV rewards
-3. Fallbacks: Local analysis for reliability
+3. Graffiti: Consensus client identification from block graffiti
+4. Fallbacks: Local analysis for reliability
 """
 
 import os
@@ -13,6 +14,7 @@ import json
 import time
 import logging
 import requests
+import re
 from collections import Counter, defaultdict
 from typing import Dict, List, Tuple, Set, Optional
 from web3 import Web3
@@ -73,9 +75,126 @@ class RewardComponents:
         # Total = consensus + execution (MEV is already included in execution)
         self.total_wei = self.consensus_wei + self.execution_wei
 
+class GraffitiAnalyzer:
+    """
+    Analyzes beacon block graffiti to identify consensus clients
+    """
+    
+    def __init__(self):
+        # Client signature patterns (case-insensitive)
+        self.client_patterns = {
+            'lighthouse': [
+                r'lighthouse', r'sigp', r'sigma.*prime', r'lh/', r'lighthouse/v'
+            ],
+            'prysm': [
+                r'prysm', r'prysmatic', r'prysmaticlabs', r'prysm/v'
+            ],
+            'teku': [
+                r'teku', r'consensys', r'pegasys', r'artemis', r'teku/v'
+            ],
+            'nimbus': [
+                r'nimbus', r'status\.im', r'nim-beacon', r'nimbus/v'
+            ],
+            'lodestar': [
+                r'lodestar', r'chainsafe', r'lodestar/v'
+            ],
+            'grandine': [
+                r'grandine', r'grandine/v'
+            ]
+        }
+        
+        # Common pool/service signatures that might mask client info
+        self.pool_patterns = [
+            r'rocketpool', r'rocket.*pool', r'rp', r'stakewise', r'lido',
+            r'coinbase', r'kraken', r'binance', r'ethereum.*on.*arm'
+        ]
+
+    def _decode_graffiti(self, graffiti_hex: str) -> str:
+        """
+        Decode graffiti from hex to readable string
+        """
+        try:
+            if graffiti_hex.startswith('0x'):
+                graffiti_hex = graffiti_hex[2:]
+            
+            # Remove trailing zeros
+            graffiti_hex = graffiti_hex.rstrip('0')
+            if len(graffiti_hex) % 2 != 0:
+                graffiti_hex += '0'
+            
+            # Convert hex to bytes and decode
+            graffiti_bytes = bytes.fromhex(graffiti_hex)
+            graffiti_text = graffiti_bytes.decode('utf-8', errors='ignore').strip()
+            
+            return graffiti_text
+        
+        except Exception:
+            return graffiti_hex  # Return original if decoding fails
+
+    def identify_client(self, graffiti: str) -> Optional[str]:
+        """
+        Identify consensus client from graffiti text
+        """
+        if not graffiti:
+            return None
+            
+        graffiti_lower = graffiti.lower()
+        
+        # Check each client pattern
+        for client, patterns in self.client_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, graffiti_lower):
+                    return client
+        
+        return None
+
+    def is_pool_signature(self, graffiti: str) -> bool:
+        """
+        Check if graffiti contains pool/service signature
+        """
+        if not graffiti:
+            return False
+            
+        graffiti_lower = graffiti.lower()
+        for pattern in self.pool_patterns:
+            if re.search(pattern, graffiti_lower):
+                return True
+        return False
+
+    def extract_version_info(self, graffiti: str) -> Optional[str]:
+        """
+        Extract version information from graffiti
+        """
+        version_patterns = [
+            r'v?(\d+\.\d+\.\d+(?:-\w+)?)',
+            r'version[:\s]+(\d+\.\d+\.\d+)',
+            r'/v(\d+\.\d+\.\d+)'
+        ]
+        
+        for pattern in version_patterns:
+            match = re.search(pattern, graffiti, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        
+        return None
+
+    def analyze_graffiti(self, graffiti_hex: str) -> Dict[str, Optional[str]]:
+        """
+        Complete graffiti analysis returning all extracted information
+        """
+        graffiti_text = self._decode_graffiti(graffiti_hex)
+        
+        return {
+            'graffiti_text': graffiti_text,
+            'client': self.identify_client(graffiti_text),
+            'version': self.extract_version_info(graffiti_text),
+            'is_pool': self.is_pool_signature(graffiti_text)
+        }
+
 class ComprehensiveProposalTracker:
     """
     Comprehensive block proposal tracker using multiple data sources for extended periods.
+    Now includes graffiti analysis for consensus client identification.
     """
 
     def __init__(self, eth_client_url: str, beacon_api_url: str, 
@@ -83,6 +202,7 @@ class ComprehensiveProposalTracker:
         self.web3 = self._setup_web3(eth_client_url)
         self.beacon_api_url = self._setup_beacon_api(beacon_api_url)
         self.enable_external_apis = enable_external_apis
+        self.graffiti_analyzer = GraffitiAnalyzer()
         
         self.cache = self._load_cache()
         self.validator_data = self._load_validator_data()
@@ -140,7 +260,8 @@ class ComprehensiveProposalTracker:
         return {
             'last_slot': self._get_deployment_slot(),
             'proposals_found': 0,
-            'last_updated': 0
+            'last_updated': 0,
+            'client_diversity_stats': {}
         }
 
     def _get_deployment_slot(self) -> int:
@@ -227,6 +348,30 @@ class ComprehensiveProposalTracker:
         except Exception as e:
             logging.debug("Error fetching block %d: %s", slot, str(e))
             return None
+
+    def _extract_graffiti_data(self, beacon_block: dict) -> dict:
+        """Extract and analyze graffiti from beacon block."""
+        try:
+            graffiti_hex = beacon_block['message']['body']['graffiti']
+            graffiti_analysis = self.graffiti_analyzer.analyze_graffiti(graffiti_hex)
+            
+            return {
+                'graffiti_hex': graffiti_hex,
+                'graffiti_text': graffiti_analysis['graffiti_text'],
+                'consensus_client': graffiti_analysis['client'],
+                'client_version': graffiti_analysis['version'],
+                'has_pool_signature': graffiti_analysis['is_pool']
+            }
+            
+        except Exception as e:
+            logging.debug("Error extracting graffiti: %s", str(e))
+            return {
+                'graffiti_hex': '',
+                'graffiti_text': '',
+                'consensus_client': None,
+                'client_version': None,
+                'has_pool_signature': False
+            }
 
     def _get_consensus_rewards_local(self, slot: int, validator_index: int) -> Tuple[int, dict]:
         """Get consensus rewards from local beacon API."""
@@ -514,6 +659,7 @@ class ComprehensiveProposalTracker:
         Calculate rewards using:
         1. Local Lighthouse for consensus rewards (archive mode)
         2. Beaconcha.in for execution and MEV rewards
+        3. Graffiti analysis for consensus client identification
         """
         slot = int(beacon_block['message']['slot'])
         proposer_index = int(beacon_block['message']['proposer_index'])
@@ -521,6 +667,9 @@ class ComprehensiveProposalTracker:
         fee_recipient = Web3.to_checksum_address(execution_payload['fee_recipient'])
         block_number = int(execution_payload['block_number'])
         block_hash = execution_payload.get('block_hash', '')
+        
+        # Extract graffiti data
+        graffiti_data = self._extract_graffiti_data(beacon_block)
         
         # 1. CONSENSUS REWARDS - Use local Lighthouse
         consensus_wei, consensus_details = self._get_consensus_rewards_enhanced_local(slot, proposer_index, beacon_block)
@@ -569,6 +718,9 @@ class ComprehensiveProposalTracker:
             'proposer_index': proposer_index,
             'fee_recipient': fee_recipient,
             
+            # Graffiti and consensus client data
+            **graffiti_data,
+            
             # Clean format matching original with full decimal precision
             'consensus_reward_eth': round(consensus_wei / 1e18, 10),
             'execution_fees_eth': round(execution_wei / 1e18, 10),
@@ -593,7 +745,7 @@ class ComprehensiveProposalTracker:
             
             # Data source tracking
             'data_sources_used': rewards.data_sources,
-            'calculation_method': 'lighthouse_plus_beaconchain',
+            'calculation_method': 'lighthouse_plus_beaconchain_plus_graffiti',
             
             # Detailed breakdowns (for advanced analysis, but not cluttering main format)
             'detailed_consensus': {
@@ -633,6 +785,53 @@ class ComprehensiveProposalTracker:
                 logging.warning("Error loading existing proposals: %s", str(e))
         return []
 
+    def _analyze_client_diversity(self, proposals: List[dict]) -> dict:
+        """Analyze consensus client diversity from proposals."""
+        client_stats = defaultdict(lambda: {
+            'proposal_count': 0,
+            'operators': set(),
+            'total_value_eth': 0,
+            'versions': set()
+        })
+        
+        total_proposals = 0
+        identified_proposals = 0
+        
+        for proposal in proposals:
+            total_proposals += 1
+            client = proposal.get('consensus_client')
+            operator = proposal.get('operator')
+            value = proposal.get('total_value_eth', 0)
+            version = proposal.get('client_version')
+            
+            if client:
+                identified_proposals += 1
+                client_stats[client]['proposal_count'] += 1
+                client_stats[client]['operators'].add(operator)
+                client_stats[client]['total_value_eth'] += value
+                if version:
+                    client_stats[client]['versions'].add(version)
+        
+        # Convert sets to lists for JSON serialization and calculate percentages
+        diversity_stats = {}
+        for client, stats in client_stats.items():
+            diversity_stats[client] = {
+                'proposal_count': stats['proposal_count'],
+                'proposal_percentage': (stats['proposal_count'] / identified_proposals * 100) if identified_proposals > 0 else 0,
+                'unique_operators': len(stats['operators']),
+                'total_value_eth': stats['total_value_eth'],
+                'value_percentage': (stats['total_value_eth'] / sum(s['total_value_eth'] for s in client_stats.values()) * 100) if sum(s['total_value_eth'] for s in client_stats.values()) > 0 else 0,
+                'versions_detected': list(stats['versions'])
+            }
+        
+        return {
+            'total_proposals': total_proposals,
+            'identified_proposals': identified_proposals,
+            'identification_rate': (identified_proposals / total_proposals * 100) if total_proposals > 0 else 0,
+            'client_distribution': diversity_stats,
+            'analysis_timestamp': datetime.datetime.now().isoformat()
+        }
+
     def _save_proposals(self, proposals: List[dict]) -> None:
         """Save comprehensive proposal data to file."""
         try:
@@ -642,7 +841,9 @@ class ComprehensiveProposalTracker:
                 'consensus_rewards': 0,
                 'execution_rewards': 0,
                 'mev_rewards': 0,
-                'mev_blocks': 0
+                'mev_blocks': 0,
+                'clients_used': defaultdict(int),
+                'pool_signatures': 0
             })
             
             for proposal in proposals:
@@ -654,6 +855,15 @@ class ComprehensiveProposalTracker:
                 operator_stats[op]['mev_rewards'] += proposal.get('mev_breakdown_eth', 0)
                 if proposal.get('is_mev_boost_block', False):
                     operator_stats[op]['mev_blocks'] += 1
+                
+                # Track consensus clients used
+                client = proposal.get('consensus_client')
+                if client:
+                    operator_stats[op]['clients_used'][client] += 1
+                
+                # Track pool signatures
+                if proposal.get('has_pool_signature', False):
+                    operator_stats[op]['pool_signatures'] += 1
 
             # Calculate aggregate statistics
             total_proposals = len(proposals)
@@ -662,6 +872,9 @@ class ComprehensiveProposalTracker:
             total_execution = sum(p.get('execution_fees_eth', 0) for p in proposals)
             total_mev = sum(p.get('mev_breakdown_eth', 0) for p in proposals)
             mev_boost_count = len([p for p in proposals if p.get('is_mev_boost_block', False)])
+            
+            # Analyze client diversity
+            client_diversity = self._analyze_client_diversity(proposals)
 
             data = {
                 'metadata': {
@@ -674,9 +887,10 @@ class ComprehensiveProposalTracker:
                     'mev_boost_blocks': mev_boost_count,
                     'mev_boost_percentage': (mev_boost_count / total_proposals * 100) if total_proposals > 0 else 0,
                     'operators_tracked': len(operator_stats),
-                    'data_sources': ['local_lighthouse', 'beaconchain_api'],
-                    'calculation_method': 'lighthouse_plus_beaconchain'
+                    'data_sources': ['local_lighthouse', 'beaconchain_api', 'graffiti_analysis'],
+                    'calculation_method': 'lighthouse_plus_beaconchain_plus_graffiti'
                 },
+                'client_diversity': client_diversity,
                 'operator_summary': {
                     op: {
                         'proposal_count': stats['count'],
@@ -686,7 +900,11 @@ class ComprehensiveProposalTracker:
                         'execution_rewards_eth': stats['execution_rewards'],
                         'mev_rewards_eth': stats['mev_rewards'],
                         'mev_blocks_count': stats['mev_blocks'],
-                        'mev_blocks_percentage': (stats['mev_blocks'] / stats['count'] * 100) if stats['count'] > 0 else 0
+                        'mev_blocks_percentage': (stats['mev_blocks'] / stats['count'] * 100) if stats['count'] > 0 else 0,
+                        'clients_used': dict(stats['clients_used']),
+                        'primary_client': max(stats['clients_used'].items(), key=lambda x: x[1])[0] if stats['clients_used'] else None,
+                        'pool_signatures_count': stats['pool_signatures'],
+                        'pool_signatures_percentage': (stats['pool_signatures'] / stats['count'] * 100) if stats['count'] > 0 else 0
                     }
                     for op, stats in operator_stats.items()
                 },
@@ -696,13 +914,16 @@ class ComprehensiveProposalTracker:
             with open(PROPOSAL_DATA_FILE, 'w') as f:
                 json.dump(data, f, indent=2, cls=DecimalEncoder)
 
+            # Update cache with diversity stats
+            self.cache['client_diversity_stats'] = client_diversity
+
             logging.info("Saved %d comprehensive proposals totaling %.6f ETH", len(proposals), total_value)
 
         except Exception as e:
             logging.error("Error saving proposals: %s", str(e))
 
     def scan_proposals(self, max_slots: Optional[int] = None) -> int:
-        """Scan for new block proposals with comprehensive reward tracking."""
+        """Scan for new block proposals with comprehensive reward tracking and graffiti analysis."""
         start_slot = self.cache['last_slot'] + 1
         current_slot = self._get_current_slot()
         
@@ -723,12 +944,12 @@ class ComprehensiveProposalTracker:
         start_date = datetime.datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S")
         end_date = datetime.datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S")
         
-        print(f"=== COMPREHENSIVE NODESET PROPOSAL SCAN ===")
+        print(f"=== COMPREHENSIVE NODESET PROPOSAL SCAN WITH GRAFFITI ANALYSIS ===")
         print(f"Time range: {start_date} to {end_date}")
         print(f"Slot range: {start_slot:,} to {end_slot:,} ({total_slots:,} slots)")
         print(f"Tracking {len(self.tracked_validators)} validators")
         print(f"External APIs enabled: {self.enable_external_apis}")
-        print(f"Data sources: Local Lighthouse + {'Beaconcha.in' if self.enable_external_apis else 'Local only'}")
+        print(f"Data sources: Local Lighthouse + {'Beaconcha.in' if self.enable_external_apis else 'Local only'} + Graffiti Analysis")
         
         if self.cache['last_slot'] > 0:
             print(f"Resuming from slot {self.cache['last_slot']:,}")
@@ -738,6 +959,7 @@ class ComprehensiveProposalTracker:
         slots_processed = 0
         api_calls = 0
         skipped_slots = 0
+        client_detections = 0
         existing_proposals = self._load_existing_proposals()
 
         chunk_size = 5000  # Smaller chunks due to more detailed processing
@@ -763,7 +985,7 @@ class ComprehensiveProposalTracker:
                         
                         print(f"  ✓ Found proposal: slot {slot:,}, validator {proposer_index}")
                         
-                        # Calculate comprehensive rewards
+                        # Calculate comprehensive rewards including graffiti
                         rewards, details = self._calculate_rewards(block_data)
                         
                         epoch = slot // SLOTS_PER_EPOCH
@@ -787,25 +1009,36 @@ class ComprehensiveProposalTracker:
                         existing_proposals.append(proposal)
                         proposals_found += 1
 
+                        # Track client detection
+                        if details.get('consensus_client'):
+                            client_detections += 1
+
                         operator_display = self._format_operator_name(validator_info)
                         consensus_eth = details.get('consensus_reward_eth', 0)
                         execution_eth = details.get('execution_fees_eth', 0)
                         mev_eth = details.get('mev_breakdown_eth', 0)
                         is_mev = details.get('is_mev_boost_block', False)
+                        client = details.get('consensus_client')
+                        version = details.get('client_version')
                         
                         print(f"    {operator_display}")
                         print(f"    Consensus: {consensus_eth:.6f} ETH, Execution: {execution_eth:.6f} ETH")
                         if is_mev:
                             print(f"    MEV: {mev_eth:.6f} ETH ({details.get('mev_percentage', 0):.1f}% of execution)")
                             print(f"    Relay: {details.get('relay_tag', 'unknown')}")
+                        if client:
+                            client_display = f"{client.title()}"
+                            if version:
+                                client_display += f" v{version}"
+                            print(f"    Client: {client_display}")
                         print(f"    Total: {rewards.total_wei/1e18:.6f} ETH")
                         
-                        logging.info("Proposal: slot %d, validator %d, total %.6f ETH (cons: %.6f, exec: %.6f, mev: %.6f)", 
-                                   slot, proposer_index, rewards.total_wei/1e18, consensus_eth, execution_eth, mev_eth)
+                        logging.info("Proposal: slot %d, validator %d, total %.6f ETH (cons: %.6f, exec: %.6f, mev: %.6f, client: %s)", 
+                                   slot, proposer_index, rewards.total_wei/1e18, consensus_eth, execution_eth, mev_eth, client or 'unknown')
 
                     if slots_processed % 10000 == 0:
                         progress_pct = slots_processed / total_slots * 100
-                        print(f"  Progress: {slots_processed:,}/{total_slots:,} slots ({progress_pct:.1f}%), {proposals_found} proposals, {api_calls:,} API calls")
+                        print(f"  Progress: {slots_processed:,}/{total_slots:,} slots ({progress_pct:.1f}%), {proposals_found} proposals, {client_detections} clients detected, {api_calls:,} API calls")
                         
                         # Save intermediate progress
                         self.cache.update({
@@ -819,7 +1052,8 @@ class ComprehensiveProposalTracker:
                     continue
 
             chunk_proposals = len([p for p in existing_proposals if chunk_start <= p['slot'] <= chunk_end])
-            print(f"Chunk complete: {chunk_proposals} proposals found in slots {chunk_start:,}-{chunk_end:,}")
+            chunk_clients = len([p for p in existing_proposals if chunk_start <= p['slot'] <= chunk_end and p.get('consensus_client')])
+            print(f"Chunk complete: {chunk_proposals} proposals found, {chunk_clients} clients identified in slots {chunk_start:,}-{chunk_end:,}")
 
         self.cache.update({
             'last_slot': end_slot,
@@ -830,10 +1064,11 @@ class ComprehensiveProposalTracker:
         if existing_proposals:
             self._save_proposals(existing_proposals)
 
-        print(f"\n=== COMPREHENSIVE SCAN COMPLETE ===")
+        print(f"\n=== COMPREHENSIVE SCAN WITH GRAFFITI ANALYSIS COMPLETE ===")
         print(f"  Slots processed: {slots_processed:,}")
         print(f"  Skipped slots (no block): {skipped_slots:,}")
         print(f"  Proposals found: {proposals_found}")
+        print(f"  Consensus clients identified: {client_detections}/{proposals_found} ({client_detections/proposals_found*100:.1f}%)" if proposals_found > 0 else "  No proposals found")
         print(f"  API calls made: {api_calls:,}")
         print(f"  Total proposals tracked: {len(existing_proposals)}")
         
@@ -846,7 +1081,7 @@ class ComprehensiveProposalTracker:
         return proposals_found
 
     def generate_comprehensive_report(self) -> None:
-        """Generate comprehensive proposal summary report."""
+        """Generate comprehensive proposal summary report with client diversity analysis."""
         if not os.path.exists(PROPOSAL_DATA_FILE):
             print("No proposal data available")
             return
@@ -858,9 +1093,10 @@ class ComprehensiveProposalTracker:
             metadata = data.get('metadata', {})
             operator_summary = data.get('operator_summary', {})
             proposals = data.get('proposals', [])
+            client_diversity = data.get('client_diversity', {})
 
             print("\n" + "="*80)
-            print("COMPREHENSIVE NODESET BLOCK PROPOSAL REPORT")
+            print("COMPREHENSIVE NODESET BLOCK PROPOSAL REPORT WITH CLIENT DIVERSITY")
             print("="*80)
 
             total_proposals = metadata.get('total_proposals', 0)
@@ -880,6 +1116,31 @@ class ComprehensiveProposalTracker:
             print(f"  MEV component: {total_mev:.6f} ETH ({total_mev/total_value*100:.1f}%)")
             print(f"MEV-Boost blocks: {mev_boost_blocks:,}/{total_proposals:,} ({mev_boost_pct:.1f}%)")
             print(f"Operators with proposals: {operators_count}")
+
+            # Client diversity analysis
+            if client_diversity:
+                print(f"\n=== CONSENSUS CLIENT DIVERSITY ===")
+                identified_proposals = client_diversity.get('identified_proposals', 0)
+                identification_rate = client_diversity.get('identification_rate', 0)
+                
+                print(f"Total proposals analyzed: {total_proposals:,}")
+                print(f"Proposals with client identification: {identified_proposals:,} ({identification_rate:.1f}%)")
+                
+                client_distribution = client_diversity.get('client_distribution', {})
+                if client_distribution:
+                    print("\nClient distribution by proposals:")
+                    for client, stats in sorted(client_distribution.items(), key=lambda x: x[1]['proposal_count'], reverse=True):
+                        count = stats['proposal_count']
+                        percentage = stats['proposal_percentage']
+                        operators = stats['unique_operators']
+                        value_eth = stats['total_value_eth']
+                        value_pct = stats['value_percentage']
+                        
+                        print(f"  {client.title()}: {count} proposals ({percentage:.1f}%), {operators} operators, {value_eth:.6f} ETH ({value_pct:.1f}%)")
+                        
+                        versions = stats.get('versions_detected', [])
+                        if versions:
+                            print(f"    Versions: {', '.join(sorted(versions))}")
 
             if operator_summary:
                 print(f"\n=== TOP OPERATORS BY PROPOSALS ===")
@@ -901,11 +1162,46 @@ class ComprehensiveProposalTracker:
                     mev = stats['mev_rewards_eth']
                     mev_blocks = stats['mev_blocks_count']
                     mev_pct = stats['mev_blocks_percentage']
+                    primary_client = stats.get('primary_client')
+                    clients_used = stats.get('clients_used', {})
+                    pool_sigs = stats.get('pool_signatures_count', 0)
 
                     print(f"{count:3d} proposals: {display_name}")
                     print(f"     Total: {value:.6f} ETH (avg: {avg:.6f} ETH)")
                     print(f"     Consensus: {consensus:.6f} ETH, Execution: {execution:.6f} ETH, MEV: {mev:.6f} ETH")
                     print(f"     MEV-Boost: {mev_blocks}/{count} blocks ({mev_pct:.1f}%)")
+                    
+                    if primary_client:
+                        client_display = primary_client.title()
+                        if len(clients_used) > 1:
+                            other_clients = [c for c in clients_used.keys() if c != primary_client]
+                            client_display += f" (primary), also uses: {', '.join(c.title() for c in other_clients)}"
+                        print(f"     Client: {client_display}")
+                    
+                    if pool_sigs > 0:
+                        pool_pct = stats.get('pool_signatures_percentage', 0)
+                        print(f"     Pool signatures: {pool_sigs}/{count} blocks ({pool_pct:.1f}%)")
+
+                print(f"\n=== OPERATORS BY CLIENT TYPE ===")
+                # Group operators by their primary client
+                client_operators = defaultdict(list)
+                for operator, stats in operator_summary.items():
+                    primary_client = stats.get('primary_client')
+                    if primary_client:
+                        proposal_count = stats['proposal_count']
+                        total_value = stats['total_value_eth']
+                        client_operators[primary_client].append((operator, proposal_count, total_value))
+                
+                for client in sorted(client_operators.keys()):
+                    operators = sorted(client_operators[client], key=lambda x: x[1], reverse=True)
+                    total_proposals_for_client = sum(count for _, count, _ in operators)
+                    total_value_for_client = sum(value for _, _, value in operators)
+                    
+                    print(f"\n{client.title()} operators ({len(operators)} operators, {total_proposals_for_client} proposals, {total_value_for_client:.6f} ETH):")
+                    for operator, count, value in operators[:5]:  # Top 5 for each client
+                        ens_name = self.validator_data.get('ens_names', {}).get(operator)
+                        display_name = f"{ens_name} ({operator[:8]}...)" if ens_name else f"{operator[:8]}..."
+                        print(f"  {count} proposals ({value:.6f} ETH): {display_name}")
 
                 print(f"\n=== TOP OPERATORS BY VALUE ===")
                 sorted_by_value = sorted(
@@ -921,8 +1217,9 @@ class ComprehensiveProposalTracker:
                     value = stats['total_value_eth']
                     count = stats['proposal_count']
                     mev = stats['mev_rewards_eth']
+                    client = stats.get('primary_client', 'Unknown')
 
-                    print(f"{value:.6f} ETH: {display_name} ({count} proposals, {mev:.6f} ETH MEV)")
+                    print(f"{value:.6f} ETH: {display_name} ({count} proposals, {mev:.6f} ETH MEV, {client.title()})")
 
             if proposals:
                 print(f"\n=== RECENT HIGH-VALUE PROPOSALS ===")
@@ -942,11 +1239,17 @@ class ComprehensiveProposalTracker:
                     mev = proposal.get('mev_breakdown_eth', 0)
                     is_mev = proposal.get('is_mev_boost_block', False)
                     relay = proposal.get('relay_tag', '')
+                    client = proposal.get('consensus_client', 'Unknown')
+                    version = proposal.get('client_version', '')
 
                     print(f"Slot {slot:,} ({date}): {operator_name}")
                     print(f"  Value: {value:.6f} ETH (C: {consensus:.6f}, E: {execution:.6f}, MEV: {mev:.6f})")
                     if is_mev and relay:
                         print(f"  MEV-Boost via {relay}")
+                    client_display = client.title()
+                    if version:
+                        client_display += f" v{version}"
+                    print(f"  Client: {client_display}")
 
         except Exception as e:
             logging.error("Error generating comprehensive report: %s", str(e))
@@ -962,10 +1265,11 @@ def main():
     if not beacon_api_url:
         raise ValueError("BEACON_API_URL environment variable is required")
 
-    print("Comprehensive NodeSet Block Proposal Tracker")
+    print("Comprehensive NodeSet Block Proposal Tracker with Graffiti Analysis")
     print("Consensus rewards: Local archive Lighthouse (beacon chain duties)")
     print("Execution rewards: Beaconcha.in API (total execution layer rewards)")
     print("MEV breakdown: Tracked separately within execution rewards")
+    print("Client identification: Graffiti analysis from beacon blocks")
     print("Fallback: Local analysis if external APIs fail")
 
     tracker = ComprehensiveProposalTracker(eth_client_url, beacon_api_url, enable_external_apis=True)
