@@ -1,12 +1,8 @@
 """
-NodeSet Block Proposal Tracker - Comprehensive Version with Graffiti Analysis
-Combines local clients with external APIs for complete reward tracking and consensus client detection
+NodeSet Block Proposal Tracker with Missed Proposal Detection
 
-Data Sources:
-1. Local: Lighthouse beacon + pruned execution client
-2. External: Beaconcha.in API for execution/MEV rewards
-3. Graffiti: Consensus client identification from block graffiti
-4. Fallbacks: Local analysis for reliability
+Tracks both successful and missed block proposals for NodeSet validators.
+Uses local Lighthouse + beaconcha.in API for comprehensive reward analysis.
 """
 
 import os
@@ -19,26 +15,22 @@ from collections import Counter, defaultdict
 from typing import Dict, List, Tuple, Set, Optional
 from web3 import Web3
 import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import decimal
 
 class DecimalEncoder(json.JSONEncoder):
-    """Custom JSON encoder to avoid scientific notation for small numbers."""
     def encode(self, obj):
         if isinstance(obj, float):
-            # Format floats to avoid scientific notation
             return format(obj, 'f')
         return super(DecimalEncoder, self).encode(obj)
     
     def iterencode(self, obj, _one_shot=False):
-        """Encode object, avoiding scientific notation."""
         if isinstance(obj, float):
             yield format(obj, 'f')
         else:
             for chunk in super(DecimalEncoder, self).iterencode(obj, _one_shot):
                 yield chunk
 
-# Configuration
 logging.basicConfig(
     level=logging.INFO,
     filename='proposal_tracker.log',
@@ -46,42 +38,65 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# Constants
 GENESIS_TIME = 1606824023
 SECONDS_PER_SLOT = 12
 SLOTS_PER_EPOCH = 32
 DEPLOYMENT_BLOCK = 22318339
 
-# Cache files
 VALIDATOR_CACHE_FILE = "nodeset_validator_tracker_cache.json"
 PROPOSAL_CACHE_FILE = "proposal_cache.json"
 PROPOSAL_DATA_FILE = "proposals.json"
+MISSED_PROPOSALS_CACHE_FILE = "missed_proposals_cache.json"
 
-# API Configuration
 BEACONCHAIN_API_BASE = "https://beaconcha.in/api/v1"
 
 @dataclass
 class RewardComponents:
-    """Structure for organizing reward components"""
     consensus_wei: int = 0
-    execution_wei: int = 0  # Total execution layer rewards (including MEV)
-    mev_wei: int = 0       # MEV breakdown (subset of execution_wei)
+    execution_wei: int = 0
+    mev_wei: int = 0
     total_wei: int = 0
     data_sources: List[str] = None
     
     def __post_init__(self):
         if self.data_sources is None:
             self.data_sources = []
-        # Total = consensus + execution (MEV is already included in execution)
         self.total_wei = self.consensus_wei + self.execution_wei
 
-class GraffitiAnalyzer:
-    """
-    Analyzes beacon block graffiti to identify consensus clients
-    """
+@dataclass
+class MissedProposal:
+    slot: int
+    epoch: int
+    timestamp: int
+    date: str
+    validator_index: int
+    validator_pubkey: str
+    operator: str
+    operator_name: str
+    reason: str = "missed_proposal"
+
+@dataclass
+class ProposalStats:
+    expected_proposals: int = 0
+    successful_proposals: int = 0
+    missed_proposals: int = 0
+    total_rewards_eth: float = 0.0
+    missed_slots: List[int] = field(default_factory=list)
     
+    @property
+    def success_rate(self) -> float:
+        if self.expected_proposals == 0:
+            return 0.0
+        return (self.successful_proposals / self.expected_proposals) * 100
+    
+    @property
+    def miss_rate(self) -> float:
+        if self.expected_proposals == 0:
+            return 0.0
+        return (self.missed_proposals / self.expected_proposals) * 100
+
+class GraffitiAnalyzer:
     def __init__(self):
-        # Client signature patterns (case-insensitive)
         self.client_patterns = {
             'lighthouse': [
                 r'lighthouse', r'sigp', r'sigma.*prime', r'lh/', r'lighthouse/v'
@@ -103,44 +118,34 @@ class GraffitiAnalyzer:
             ]
         }
         
-        # Common pool/service signatures that might mask client info
         self.pool_patterns = [
             r'rocketpool', r'rocket.*pool', r'rp', r'stakewise', r'lido',
             r'coinbase', r'kraken', r'binance', r'ethereum.*on.*arm'
         ]
 
     def _decode_graffiti(self, graffiti_hex: str) -> str:
-        """
-        Decode graffiti from hex to readable string
-        """
         try:
             if graffiti_hex.startswith('0x'):
                 graffiti_hex = graffiti_hex[2:]
             
-            # Remove trailing zeros
             graffiti_hex = graffiti_hex.rstrip('0')
             if len(graffiti_hex) % 2 != 0:
                 graffiti_hex += '0'
             
-            # Convert hex to bytes and decode
             graffiti_bytes = bytes.fromhex(graffiti_hex)
             graffiti_text = graffiti_bytes.decode('utf-8', errors='ignore').strip()
             
             return graffiti_text
         
         except Exception:
-            return graffiti_hex  # Return original if decoding fails
+            return graffiti_hex
 
     def identify_client(self, graffiti: str) -> Optional[str]:
-        """
-        Identify consensus client from graffiti text
-        """
         if not graffiti:
             return None
             
         graffiti_lower = graffiti.lower()
         
-        # Check each client pattern
         for client, patterns in self.client_patterns.items():
             for pattern in patterns:
                 if re.search(pattern, graffiti_lower):
@@ -149,9 +154,6 @@ class GraffitiAnalyzer:
         return None
 
     def is_pool_signature(self, graffiti: str) -> bool:
-        """
-        Check if graffiti contains pool/service signature
-        """
         if not graffiti:
             return False
             
@@ -162,9 +164,6 @@ class GraffitiAnalyzer:
         return False
 
     def extract_version_info(self, graffiti: str) -> Optional[str]:
-        """
-        Extract version information from graffiti
-        """
         version_patterns = [
             r'v?(\d+\.\d+\.\d+(?:-\w+)?)',
             r'version[:\s]+(\d+\.\d+\.\d+)',
@@ -179,9 +178,6 @@ class GraffitiAnalyzer:
         return None
 
     def analyze_graffiti(self, graffiti_hex: str) -> Dict[str, Optional[str]]:
-        """
-        Complete graffiti analysis returning all extracted information
-        """
         graffiti_text = self._decode_graffiti(graffiti_hex)
         
         return {
@@ -191,12 +187,7 @@ class GraffitiAnalyzer:
             'is_pool': self.is_pool_signature(graffiti_text)
         }
 
-class ComprehensiveProposalTracker:
-    """
-    Comprehensive block proposal tracker using multiple data sources for extended periods.
-    Now includes graffiti analysis for consensus client identification.
-    """
-
+class EnhancedProposalTracker:
     def __init__(self, eth_client_url: str, beacon_api_url: str, 
                  enable_external_apis: bool = True):
         self.web3 = self._setup_web3(eth_client_url)
@@ -207,13 +198,13 @@ class ComprehensiveProposalTracker:
         self.cache = self._load_cache()
         self.validator_data = self._load_validator_data()
         self.tracked_validators = self._get_tracked_validators()
+        self.missed_proposals_cache = self._load_missed_proposals_cache()
+        self.proposer_duties_cache = {}
         
-        # API rate limiting
         self.last_beaconchain_call = 0
-        self.beaconchain_rate_limit = 0.1  # 10 calls per second max
+        self.beaconchain_rate_limit = 0.1
 
     def _setup_web3(self, eth_client_url: str) -> Web3:
-        """Initialize Web3 connection."""
         web3 = Web3(Web3.HTTPProvider(eth_client_url))
         if not web3.is_connected():
             raise ConnectionError(f"Failed to connect to Ethereum node at {eth_client_url}")
@@ -222,13 +213,12 @@ class ComprehensiveProposalTracker:
         return web3
 
     def _setup_beacon_api(self, beacon_api_url: str) -> str:
-        """Verify beacon API connectivity."""
         try:
             response = requests.get(f"{beacon_api_url}/eth/v1/node/health", timeout=10)
             if response.status_code in [200, 206]:
                 print(f"Connected to beacon chain consensus client at {beacon_api_url}")
                 if response.status_code == 206:
-                    print("  Note: Beacon node reports partial sync status (206) but is functional")
+                    print("Note: Beacon node reports partial sync status (206) but is functional")
                 logging.info("Connected to beacon API at %s", beacon_api_url)
                 return beacon_api_url
             else:
@@ -237,7 +227,6 @@ class ComprehensiveProposalTracker:
             raise ConnectionError(f"Failed to connect to beacon API: {str(e)}")
 
     def _rate_limit_wait(self, api_type: str) -> None:
-        """Implement rate limiting for external APIs."""
         current_time = time.time()
         
         if api_type == "beaconchain":
@@ -247,7 +236,6 @@ class ComprehensiveProposalTracker:
             self.last_beaconchain_call = time.time()
 
     def _load_cache(self) -> dict:
-        """Load proposal tracking cache."""
         if os.path.exists(PROPOSAL_CACHE_FILE):
             try:
                 with open(PROPOSAL_CACHE_FILE, 'r') as f:
@@ -264,12 +252,37 @@ class ComprehensiveProposalTracker:
             'client_diversity_stats': {}
         }
 
+    def _load_missed_proposals_cache(self) -> dict:
+        if os.path.exists(MISSED_PROPOSALS_CACHE_FILE):
+            try:
+                with open(MISSED_PROPOSALS_CACHE_FILE, 'r') as f:
+                    cache = json.load(f)
+                    logging.info("Loaded missed proposals cache: %d missed proposals", 
+                               len(cache.get('missed_proposals', [])))
+                    return cache
+            except Exception as e:
+                logging.warning("Error loading missed proposals cache: %s", str(e))
+
+        return {
+            'missed_proposals': [],
+            'last_checked_epoch': 0,
+            'last_updated': 0
+        }
+
+    def _save_missed_proposals_cache(self) -> None:
+        try:
+            self.missed_proposals_cache['last_updated'] = int(time.time())
+            with open(MISSED_PROPOSALS_CACHE_FILE, 'w') as f:
+                json.dump(self.missed_proposals_cache, f, indent=2, cls=DecimalEncoder)
+            logging.info("Missed proposals cache saved: %d missed proposals", 
+                        len(self.missed_proposals_cache.get('missed_proposals', [])))
+        except Exception as e:
+            logging.error("Error saving missed proposals cache: %s", str(e))
+
     def _get_deployment_slot(self) -> int:
-        """Get the starting slot for NodeSet project."""
-        return 11594665  # NodeSet project start slot
+        return 11594665
 
     def _load_validator_data(self) -> dict:
-        """Load validator data from main tracker."""
         if not os.path.exists(VALIDATOR_CACHE_FILE):
             raise FileNotFoundError(f"Validator cache file not found: {VALIDATOR_CACHE_FILE}")
 
@@ -282,7 +295,6 @@ class ComprehensiveProposalTracker:
             raise Exception(f"Error loading validator data: {str(e)}")
 
     def _get_tracked_validators(self) -> Dict[int, dict]:
-        """Get active validators to track."""
         tracked = {}
         
         validator_indices = self.validator_data.get('validator_indices', {})
@@ -307,7 +319,6 @@ class ComprehensiveProposalTracker:
         return tracked
 
     def _save_cache(self) -> None:
-        """Save proposal tracking cache."""
         try:
             self.cache['last_updated'] = int(time.time())
             with open(PROPOSAL_CACHE_FILE, 'w') as f:
@@ -317,7 +328,6 @@ class ComprehensiveProposalTracker:
             logging.error("Error saving cache: %s", str(e))
 
     def _get_current_slot(self) -> int:
-        """Get current beacon chain slot."""
         try:
             response = requests.get(f"{self.beacon_api_url}/eth/v1/beacon/headers/head", timeout=10)
             if response.status_code == 200:
@@ -330,11 +340,9 @@ class ComprehensiveProposalTracker:
         return (current_time - GENESIS_TIME) // SECONDS_PER_SLOT
 
     def _slot_to_timestamp(self, slot: int) -> int:
-        """Convert slot to timestamp."""
         return GENESIS_TIME + (slot * SECONDS_PER_SLOT)
 
     def _get_block_details(self, slot: int) -> Optional[dict]:
-        """Get block details for slot."""
         try:
             response = requests.get(f"{self.beacon_api_url}/eth/v2/beacon/blocks/{slot}", timeout=30)
             
@@ -350,7 +358,6 @@ class ComprehensiveProposalTracker:
             return None
 
     def _extract_graffiti_data(self, beacon_block: dict) -> dict:
-        """Extract and analyze graffiti from beacon block."""
         try:
             graffiti_hex = beacon_block['message']['body']['graffiti']
             graffiti_analysis = self.graffiti_analyzer.analyze_graffiti(graffiti_hex)
@@ -373,8 +380,79 @@ class ComprehensiveProposalTracker:
                 'has_pool_signature': False
             }
 
+    def _get_proposer_duties_for_epoch(self, epoch: int) -> Dict[int, int]:
+        if epoch in self.proposer_duties_cache:
+            return self.proposer_duties_cache[epoch]
+        
+        try:
+            response = requests.get(
+                f"{self.beacon_api_url}/eth/v1/validator/duties/proposer/{epoch}",
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                duties = {}
+                
+                for duty in data.get('data', []):
+                    slot = int(duty['slot'])
+                    validator_index = int(duty['validator_index'])
+                    duties[slot] = validator_index
+                
+                self.proposer_duties_cache[epoch] = duties
+                logging.debug("Loaded proposer duties for epoch %d: %d slots", epoch, len(duties))
+                return duties
+            
+            else:
+                logging.warning("Failed to get proposer duties for epoch %d: HTTP %d", 
+                              epoch, response.status_code)
+                return {}
+                
+        except Exception as e:
+            logging.error("Error getting proposer duties for epoch %d: %s", epoch, str(e))
+            return {}
+
+    def _is_slot_missed(self, slot: int) -> bool:
+        try:
+            response = requests.get(
+                f"{self.beacon_api_url}/eth/v2/beacon/blocks/{slot}",
+                timeout=10
+            )
+            
+            if response.status_code == 404:
+                return True
+            elif response.status_code == 200:
+                return False
+            else:
+                logging.debug("Unclear slot status for %d: HTTP %d", slot, response.status_code)
+                return False
+                
+        except requests.exceptions.Timeout:
+            logging.debug("Timeout checking slot %d", slot)
+            return False
+        except Exception as e:
+            logging.debug("Error checking slot %d: %s", slot, str(e))
+            return False
+
+    def _create_missed_proposal_record(self, slot: int, validator_index: int) -> MissedProposal:
+        validator_info = self.tracked_validators[validator_index]
+        epoch = slot // SLOTS_PER_EPOCH
+        timestamp = self._slot_to_timestamp(slot)
+        date_str = datetime.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        
+        return MissedProposal(
+            slot=slot,
+            epoch=epoch,
+            timestamp=timestamp,
+            date=date_str,
+            validator_index=validator_index,
+            validator_pubkey=validator_info['pubkey'],
+            operator=validator_info['operator'],
+            operator_name=self._format_operator_name(validator_info),
+            reason="missed_proposal"
+        )
+
     def _get_consensus_rewards_local(self, slot: int, validator_index: int) -> Tuple[int, dict]:
-        """Get consensus rewards from local beacon API."""
         try:
             response = requests.get(
                 f"{self.beacon_api_url}/eth/v1/beacon/rewards/blocks/{slot}",
@@ -413,26 +491,22 @@ class ComprehensiveProposalTracker:
         return 0, {}
 
     def _get_consensus_rewards_enhanced_local(self, slot: int, validator_index: int, beacon_block: dict) -> Tuple[int, dict]:
-        """Enhanced consensus rewards calculation using local beacon data + network analysis."""
         try:
             epoch = slot // SLOTS_PER_EPOCH
             
-            # Try to get precise rewards from local beacon API first
             local_rewards, local_details = self._get_consensus_rewards_local(slot, validator_index)
             
             if local_rewards > 0:
                 return local_rewards, local_details
             
-            # Enhanced estimation using beacon block data
             attestation_count = len(beacon_block['message']['body'].get('attestations', []))
             deposits_count = len(beacon_block['message']['body'].get('deposits', []))
             proposer_slashings_count = len(beacon_block['message']['body'].get('proposer_slashings', []))
             attester_slashings_count = len(beacon_block['message']['body'].get('attester_slashings', []))
             
-            # Get sync aggregate participation
             sync_aggregate = beacon_block['message']['body'].get('sync_aggregate', {})
             sync_committee_bits = sync_aggregate.get('sync_committee_bits', '')
-            sync_participation = 512  # Default to full participation
+            sync_participation = 512
             
             if sync_committee_bits:
                 try:
@@ -444,7 +518,6 @@ class ComprehensiveProposalTracker:
                 except Exception:
                     sync_participation = 512
             
-            # Current mainnet consensus reward estimates
             base_proposer_reward_gwei = 15000
             attestation_reward_per_att = 8
             attestation_rewards = attestation_count * attestation_reward_per_att
@@ -476,7 +549,6 @@ class ComprehensiveProposalTracker:
         except Exception as e:
             logging.error("Error in enhanced consensus rewards calculation: %s", str(e))
             
-            # Final fallback
             estimated_consensus_gwei = 18000
             details = {
                 'total_consensus_gwei': estimated_consensus_gwei,
@@ -486,10 +558,6 @@ class ComprehensiveProposalTracker:
             return estimated_consensus_gwei * 1e9, details
 
     def _get_execution_rewards_beaconchain(self, slot: int, block_number: int) -> Tuple[int, int, dict]:
-        """
-        Get execution and MEV rewards from beaconcha.in API.
-        Returns: (execution_wei, mev_wei, details)
-        """
         if not self.enable_external_apis:
             return 0, 0, {}
             
@@ -510,21 +578,17 @@ class ComprehensiveProposalTracker:
                     if block_data is None:
                         return 0, 0, {'data_source': 'beaconchain_null_data'}
                     
-                    # Extract reward components
                     block_reward_wei = int(block_data.get('blockReward', 0))
                     mev_reward_wei = int(block_data.get('blockMevReward', 0))
                     producer_reward_wei = int(block_data.get('producerReward', 0))
                     
-                    # Check if it's a MEV-Boost block
                     relay_info = block_data.get('relay', {}) or {}
                     is_mev_boost = bool(relay_info.get('tag'))
                     
-                    # What proposer actually received from execution layer
                     total_execution_reward = producer_reward_wei
                     mev_breakdown = mev_reward_wei if is_mev_boost else 0
                     traditional_fees = max(0, total_execution_reward - mev_breakdown)
                     
-                    # Get additional useful data
                     gas_used = block_data.get('gasUsed', 0)
                     gas_limit = block_data.get('gasLimit', 0)
                     base_fee = block_data.get('baseFee', 0)
@@ -565,7 +629,6 @@ class ComprehensiveProposalTracker:
             return 0, 0, {'data_source': 'beaconchain_error', 'error': str(e)[:100]}
 
     def _get_execution_rewards_local(self, execution_payload: dict) -> Tuple[int, dict]:
-        """Calculate execution rewards from local transaction analysis (fallback only)."""
         try:
             base_fee_per_gas = int(execution_payload.get('base_fee_per_gas', '0'))
             gas_used = int(execution_payload.get('gas_used', '0'))
@@ -574,7 +637,6 @@ class ComprehensiveProposalTracker:
             
             total_priority_fees = 0
             
-            # Try to get recent execution block if available
             block_number = int(execution_payload.get('block_number', '0'))
             current_block = self.web3.eth.block_number
             
@@ -595,9 +657,8 @@ class ComprehensiveProposalTracker:
                 except Exception as e:
                     logging.debug("Error getting execution block details: %s", str(e))
             
-            # Fallback: estimate from gas data
             if total_priority_fees == 0 and gas_used > 0:
-                avg_priority_fee = 2 * 1e9  # 2 gwei estimate
+                avg_priority_fee = 2 * 1e9
                 total_priority_fees = avg_priority_fee * gas_used
             
             details = {
@@ -617,7 +678,6 @@ class ComprehensiveProposalTracker:
             return 0, {}
 
     def _detect_mev_heuristic(self, execution_payload: dict) -> Tuple[int, dict]:
-        """Fallback MEV detection using heuristics."""
         try:
             gas_used = int(execution_payload.get('gas_used', '0'))
             gas_limit = int(execution_payload.get('gas_limit', '0'))
@@ -626,7 +686,6 @@ class ComprehensiveProposalTracker:
             mev_score = 0
             estimated_mev = 0
             
-            # Scoring heuristics
             if gas_used > (gas_limit * 0.95):
                 mev_score += 3
                 estimated_mev += 0.02 * 1e18
@@ -655,12 +714,6 @@ class ComprehensiveProposalTracker:
             return 0, {}
 
     def _calculate_rewards(self, beacon_block: dict) -> Tuple[RewardComponents, dict]:
-        """
-        Calculate rewards using:
-        1. Local Lighthouse for consensus rewards (archive mode)
-        2. Beaconcha.in for execution and MEV rewards
-        3. Graffiti analysis for consensus client identification
-        """
         slot = int(beacon_block['message']['slot'])
         proposer_index = int(beacon_block['message']['proposer_index'])
         execution_payload = beacon_block['message']['body']['execution_payload']
@@ -668,25 +721,18 @@ class ComprehensiveProposalTracker:
         block_number = int(execution_payload['block_number'])
         block_hash = execution_payload.get('block_hash', '')
         
-        # Extract graffiti data
         graffiti_data = self._extract_graffiti_data(beacon_block)
         
-        # 1. CONSENSUS REWARDS - Use local Lighthouse
         consensus_wei, consensus_details = self._get_consensus_rewards_enhanced_local(slot, proposer_index, beacon_block)
-        
-        # 2. EXECUTION + MEV REWARDS - Use beaconcha.in API
         execution_wei, mev_breakdown_wei, beaconchain_details = self._get_execution_rewards_beaconchain(slot, block_number)
         
-        # Fallback to local calculation if beaconcha.in fails
         if execution_wei == 0 and beaconchain_details.get('data_source') != 'beaconchain_api':
             execution_local_wei, execution_local_details = self._get_execution_rewards_local(execution_payload)
             mev_local_wei, mev_local_details = self._detect_mev_heuristic(execution_payload)
             
-            # In local fallback, execution = traditional fees + MEV
             execution_wei = execution_local_wei + mev_local_wei
             mev_breakdown_wei = mev_local_wei
             
-            # Combine fallback details
             combined_details = {
                 **execution_local_details,
                 **{f"mev_{k}": v for k, v in mev_local_details.items()},
@@ -697,10 +743,8 @@ class ComprehensiveProposalTracker:
             }
             
         else:
-            # Use beaconcha.in data
             combined_details = beaconchain_details
         
-        # Create reward components
         rewards = RewardComponents(
             consensus_wei=consensus_wei,
             execution_wei=execution_wei,
@@ -711,43 +755,35 @@ class ComprehensiveProposalTracker:
             ]
         )
         
-        # Combine all details for clean output format
         all_details = {
             'slot': slot,
             'block_number': block_number,
             'proposer_index': proposer_index,
             'fee_recipient': fee_recipient,
             
-            # Graffiti and consensus client data
             **graffiti_data,
             
-            # Clean format matching original with full decimal precision
             'consensus_reward_eth': round(consensus_wei / 1e18, 10),
             'execution_fees_eth': round(execution_wei / 1e18, 10),
             'mev_breakdown_eth': round(mev_breakdown_wei / 1e18, 10),
             'mev_percentage': round((mev_breakdown_wei / execution_wei * 100), 2) if execution_wei > 0 else 0,
             
-            # Gas and transaction details (original format)
             'gas_used': combined_details.get('gas_used', 0),
             'gas_limit': combined_details.get('gas_limit', 0),
             'base_fee': combined_details.get('base_fee_per_gas', 0),
             'tx_count': combined_details.get('transaction_count', 0),
             'gas_utilization': round(combined_details.get('gas_utilization', 0), 2),
             
-            # MEV-specific fields (new)
             'is_mev_boost_block': combined_details.get('is_mev_boost_block', False),
             'relay_tag': combined_details.get('relay_tag', ''),
             'builder_pubkey': combined_details.get('builder_pubkey', ''),
             
-            # Overall totals
             'total_rewards_wei': rewards.total_wei,
             'total_rewards_eth': round(rewards.total_wei / 1e18, 10),
             
-            # Data source tracking
             'data_sources_used': rewards.data_sources,
             'calculation_method': 'lighthouse_plus_beaconchain_plus_graffiti',
             
-            # Detailed breakdowns (for advanced analysis, but not cluttering main format)
             'detailed_consensus': {
                 'consensus_rewards_wei': consensus_wei,
                 **{k: v for k, v in consensus_details.items() if k.startswith(('attestation', 'sync', 'deposit', 'slashing', 'base_proposer'))}
@@ -763,7 +799,6 @@ class ComprehensiveProposalTracker:
         return rewards, all_details
 
     def _format_operator_name(self, validator_info: dict) -> str:
-        """Format operator display name."""
         ens_name = validator_info.get('ens_name')
         operator = validator_info['operator']
         
@@ -773,7 +808,6 @@ class ComprehensiveProposalTracker:
             return f"{operator[:8]}...{operator[-6:]}"
 
     def _load_existing_proposals(self) -> List[dict]:
-        """Load existing proposal data."""
         if os.path.exists(PROPOSAL_DATA_FILE):
             try:
                 with open(PROPOSAL_DATA_FILE, 'r') as f:
@@ -786,7 +820,6 @@ class ComprehensiveProposalTracker:
         return []
 
     def _analyze_client_diversity(self, proposals: List[dict]) -> dict:
-        """Analyze consensus client diversity from proposals."""
         client_stats = defaultdict(lambda: {
             'proposal_count': 0,
             'operators': set(),
@@ -812,7 +845,6 @@ class ComprehensiveProposalTracker:
                 if version:
                     client_stats[client]['versions'].add(version)
         
-        # Convert sets to lists for JSON serialization and calculate percentages
         diversity_stats = {}
         for client, stats in client_stats.items():
             diversity_stats[client] = {
@@ -833,7 +865,6 @@ class ComprehensiveProposalTracker:
         }
 
     def _save_proposals(self, proposals: List[dict]) -> None:
-        """Save comprehensive proposal data to file."""
         try:
             operator_stats = defaultdict(lambda: {
                 'count': 0, 
@@ -856,16 +887,13 @@ class ComprehensiveProposalTracker:
                 if proposal.get('is_mev_boost_block', False):
                     operator_stats[op]['mev_blocks'] += 1
                 
-                # Track consensus clients used
                 client = proposal.get('consensus_client')
                 if client:
                     operator_stats[op]['clients_used'][client] += 1
                 
-                # Track pool signatures
                 if proposal.get('has_pool_signature', False):
                     operator_stats[op]['pool_signatures'] += 1
 
-            # Calculate aggregate statistics
             total_proposals = len(proposals)
             total_value = sum(p['total_value_eth'] for p in proposals)
             total_consensus = sum(p.get('consensus_reward_eth', 0) for p in proposals)
@@ -873,7 +901,6 @@ class ComprehensiveProposalTracker:
             total_mev = sum(p.get('mev_breakdown_eth', 0) for p in proposals)
             mev_boost_count = len([p for p in proposals if p.get('is_mev_boost_block', False)])
             
-            # Analyze client diversity
             client_diversity = self._analyze_client_diversity(proposals)
 
             data = {
@@ -914,7 +941,6 @@ class ComprehensiveProposalTracker:
             with open(PROPOSAL_DATA_FILE, 'w') as f:
                 json.dump(data, f, indent=2, cls=DecimalEncoder)
 
-            # Update cache with diversity stats
             self.cache['client_diversity_stats'] = client_diversity
 
             logging.info("Saved %d comprehensive proposals totaling %.6f ETH", len(proposals), total_value)
@@ -923,7 +949,6 @@ class ComprehensiveProposalTracker:
             logging.error("Error saving proposals: %s", str(e))
 
     def scan_proposals(self, max_slots: Optional[int] = None) -> int:
-        """Scan for new block proposals with comprehensive reward tracking and graffiti analysis."""
         start_slot = self.cache['last_slot'] + 1
         current_slot = self._get_current_slot()
         
@@ -944,12 +969,11 @@ class ComprehensiveProposalTracker:
         start_date = datetime.datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S")
         end_date = datetime.datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S")
         
-        print(f"=== COMPREHENSIVE NODESET PROPOSAL SCAN WITH GRAFFITI ANALYSIS ===")
+        print(f"NodeSet Proposal Scan")
         print(f"Time range: {start_date} to {end_date}")
         print(f"Slot range: {start_slot:,} to {end_slot:,} ({total_slots:,} slots)")
         print(f"Tracking {len(self.tracked_validators)} validators")
         print(f"External APIs enabled: {self.enable_external_apis}")
-        print(f"Data sources: Local Lighthouse + {'Beaconcha.in' if self.enable_external_apis else 'Local only'} + Graffiti Analysis")
         
         if self.cache['last_slot'] > 0:
             print(f"Resuming from slot {self.cache['last_slot']:,}")
@@ -962,7 +986,7 @@ class ComprehensiveProposalTracker:
         client_detections = 0
         existing_proposals = self._load_existing_proposals()
 
-        chunk_size = 5000  # Smaller chunks due to more detailed processing
+        chunk_size = 5000
         for chunk_start in range(start_slot, end_slot + 1, chunk_size):
             chunk_end = min(chunk_start + chunk_size - 1, end_slot)
             
@@ -983,9 +1007,8 @@ class ComprehensiveProposalTracker:
                     if proposer_index in self.tracked_validators:
                         validator_info = self.tracked_validators[proposer_index]
                         
-                        print(f"  ✓ Found proposal: slot {slot:,}, validator {proposer_index}")
+                        print(f"  Found proposal: slot {slot:,}, validator {proposer_index}")
                         
-                        # Calculate comprehensive rewards including graffiti
                         rewards, details = self._calculate_rewards(block_data)
                         
                         epoch = slot // SLOTS_PER_EPOCH
@@ -1009,7 +1032,6 @@ class ComprehensiveProposalTracker:
                         existing_proposals.append(proposal)
                         proposals_found += 1
 
-                        # Track client detection
                         if details.get('consensus_client'):
                             client_detections += 1
 
@@ -1040,7 +1062,6 @@ class ComprehensiveProposalTracker:
                         progress_pct = slots_processed / total_slots * 100
                         print(f"  Progress: {slots_processed:,}/{total_slots:,} slots ({progress_pct:.1f}%), {proposals_found} proposals, {client_detections} clients detected, {api_calls:,} API calls")
                         
-                        # Save intermediate progress
                         self.cache.update({
                             'last_slot': slot,
                             'proposals_found': self.cache['proposals_found'] + proposals_found
@@ -1064,7 +1085,7 @@ class ComprehensiveProposalTracker:
         if existing_proposals:
             self._save_proposals(existing_proposals)
 
-        print(f"\n=== COMPREHENSIVE SCAN WITH GRAFFITI ANALYSIS COMPLETE ===")
+        print(f"\nScan complete")
         print(f"  Slots processed: {slots_processed:,}")
         print(f"  Skipped slots (no block): {skipped_slots:,}")
         print(f"  Proposals found: {proposals_found}")
@@ -1080,8 +1101,109 @@ class ComprehensiveProposalTracker:
         
         return proposals_found
 
+    def scan_for_missed_proposals(self, start_epoch: Optional[int] = None, 
+                                 end_epoch: Optional[int] = None) -> Tuple[int, int]:
+        if start_epoch is None:
+            start_epoch = max(
+                self.missed_proposals_cache.get('last_checked_epoch', 0),
+                self._get_deployment_slot() // SLOTS_PER_EPOCH
+            )
+        
+        if end_epoch is None:
+            current_slot = self._get_current_slot()
+            end_epoch = current_slot // SLOTS_PER_EPOCH
+        
+        print(f"\nScanning for missed proposals")
+        print(f"Epoch range: {start_epoch} to {end_epoch}")
+        print(f"Checking proposer duties for NodeSet validators...")
+        
+        missed_proposals_found = 0
+        total_slots_checked = 0
+        existing_missed = list(self.missed_proposals_cache.get('missed_proposals', []))
+        existing_slots = {mp['slot'] for mp in existing_missed}
+        
+        for epoch in range(start_epoch, end_epoch + 1):
+            print(f"Checking epoch {epoch}...")
+            
+            proposer_duties = self._get_proposer_duties_for_epoch(epoch)
+            
+            if not proposer_duties:
+                continue
+            
+            for slot, expected_proposer in proposer_duties.items():
+                total_slots_checked += 1
+                
+                if slot in existing_slots:
+                    continue
+                
+                if expected_proposer not in self.tracked_validators:
+                    continue
+                
+                if self._is_slot_missed(slot):
+                    missed_proposal = self._create_missed_proposal_record(slot, expected_proposer)
+                    
+                    missed_dict = {
+                        'slot': missed_proposal.slot,
+                        'epoch': missed_proposal.epoch,
+                        'timestamp': missed_proposal.timestamp,
+                        'date': missed_proposal.date,
+                        'validator_index': missed_proposal.validator_index,
+                        'validator_pubkey': missed_proposal.validator_pubkey,
+                        'operator': missed_proposal.operator,
+                        'operator_name': missed_proposal.operator_name,
+                        'reason': missed_proposal.reason
+                    }
+                    
+                    existing_missed.append(missed_dict)
+                    missed_proposals_found += 1
+                    
+                    print(f"  MISSED: Slot {slot}, {missed_proposal.operator_name}")
+                    logging.info("Missed proposal: slot %d, validator %d, operator %s", 
+                               slot, expected_proposer, missed_proposal.operator)
+            
+            if epoch % 10 == 0:
+                self.missed_proposals_cache['missed_proposals'] = existing_missed
+                self.missed_proposals_cache['last_checked_epoch'] = epoch
+                self._save_missed_proposals_cache()
+        
+        self.missed_proposals_cache['missed_proposals'] = existing_missed
+        self.missed_proposals_cache['last_checked_epoch'] = end_epoch
+        self._save_missed_proposals_cache()
+        
+        print(f"Missed proposal scan complete:")
+        print(f"  Slots checked: {total_slots_checked:,}")
+        print(f"  New missed proposals found: {missed_proposals_found}")
+        print(f"  Total missed proposals tracked: {len(existing_missed)}")
+        
+        return missed_proposals_found, total_slots_checked
+
+    def calculate_validator_performance_stats(self) -> Dict[str, ProposalStats]:
+        successful_proposals = []
+        if os.path.exists(PROPOSAL_DATA_FILE):
+            with open(PROPOSAL_DATA_FILE, 'r') as f:
+                data = json.load(f)
+                successful_proposals = data.get('proposals', [])
+        
+        missed_proposals = self.missed_proposals_cache.get('missed_proposals', [])
+        
+        stats_by_operator = defaultdict(ProposalStats)
+        
+        for proposal in successful_proposals:
+            operator = proposal['operator']
+            stats_by_operator[operator].successful_proposals += 1
+            stats_by_operator[operator].total_rewards_eth += proposal.get('total_value_eth', 0)
+        
+        for missed in missed_proposals:
+            operator = missed['operator']
+            stats_by_operator[operator].missed_proposals += 1
+            stats_by_operator[operator].missed_slots.append(missed['slot'])
+        
+        for operator, stats in stats_by_operator.items():
+            stats.expected_proposals = stats.successful_proposals + stats.missed_proposals
+        
+        return dict(stats_by_operator)
+
     def generate_comprehensive_report(self) -> None:
-        """Generate comprehensive proposal summary report with client diversity analysis."""
         if not os.path.exists(PROPOSAL_DATA_FILE):
             print("No proposal data available")
             return
@@ -1096,7 +1218,7 @@ class ComprehensiveProposalTracker:
             client_diversity = data.get('client_diversity', {})
 
             print("\n" + "="*80)
-            print("COMPREHENSIVE NODESET BLOCK PROPOSAL REPORT WITH CLIENT DIVERSITY")
+            print("NODESET BLOCK PROPOSAL REPORT")
             print("="*80)
 
             total_proposals = metadata.get('total_proposals', 0)
@@ -1108,7 +1230,7 @@ class ComprehensiveProposalTracker:
             mev_boost_pct = metadata.get('mev_boost_percentage', 0)
             operators_count = metadata.get('operators_tracked', 0)
 
-            print(f"\n=== OVERALL STATISTICS ===")
+            print(f"\nOverall Statistics")
             print(f"Total proposals: {total_proposals:,}")
             print(f"Total value: {total_value:.6f} ETH")
             print(f"  Consensus rewards: {total_consensus:.6f} ETH ({total_consensus/total_value*100:.1f}%)")
@@ -1117,9 +1239,8 @@ class ComprehensiveProposalTracker:
             print(f"MEV-Boost blocks: {mev_boost_blocks:,}/{total_proposals:,} ({mev_boost_pct:.1f}%)")
             print(f"Operators with proposals: {operators_count}")
 
-            # Client diversity analysis
             if client_diversity:
-                print(f"\n=== CONSENSUS CLIENT DIVERSITY ===")
+                print(f"\nConsensus Client Diversity")
                 identified_proposals = client_diversity.get('identified_proposals', 0)
                 identification_rate = client_diversity.get('identification_rate', 0)
                 
@@ -1143,7 +1264,7 @@ class ComprehensiveProposalTracker:
                             print(f"    Versions: {', '.join(sorted(versions))}")
 
             if operator_summary:
-                print(f"\n=== TOP OPERATORS BY PROPOSALS ===")
+                print(f"\nTop Operators by Proposals")
                 sorted_operators = sorted(
                     operator_summary.items(),
                     key=lambda x: x[1]['proposal_count'],
@@ -1182,8 +1303,7 @@ class ComprehensiveProposalTracker:
                         pool_pct = stats.get('pool_signatures_percentage', 0)
                         print(f"     Pool signatures: {pool_sigs}/{count} blocks ({pool_pct:.1f}%)")
 
-                print(f"\n=== OPERATORS BY CLIENT TYPE ===")
-                # Group operators by their primary client
+                print(f"\nOperators by Client Type")
                 client_operators = defaultdict(list)
                 for operator, stats in operator_summary.items():
                     primary_client = stats.get('primary_client')
@@ -1198,12 +1318,12 @@ class ComprehensiveProposalTracker:
                     total_value_for_client = sum(value for _, _, value in operators)
                     
                     print(f"\n{client.title()} operators ({len(operators)} operators, {total_proposals_for_client} proposals, {total_value_for_client:.6f} ETH):")
-                    for operator, count, value in operators[:5]:  # Top 5 for each client
+                    for operator, count, value in operators[:5]:
                         ens_name = self.validator_data.get('ens_names', {}).get(operator)
                         display_name = f"{ens_name} ({operator[:8]}...)" if ens_name else f"{operator[:8]}..."
                         print(f"  {count} proposals ({value:.6f} ETH): {display_name}")
 
-                print(f"\n=== TOP OPERATORS BY VALUE ===")
+                print(f"\nTop Operators by Value")
                 sorted_by_value = sorted(
                     operator_summary.items(),
                     key=lambda x: x[1]['total_value_eth'],
@@ -1222,7 +1342,7 @@ class ComprehensiveProposalTracker:
                     print(f"{value:.6f} ETH: {display_name} ({count} proposals, {mev:.6f} ETH MEV, {client.title()})")
 
             if proposals:
-                print(f"\n=== RECENT HIGH-VALUE PROPOSALS ===")
+                print(f"\nRecent High-Value Proposals")
                 recent_high_value = sorted(
                     [p for p in proposals if p['total_value_eth'] > 0.01], 
                     key=lambda x: x['total_value_eth'], 
@@ -1254,9 +1374,109 @@ class ComprehensiveProposalTracker:
         except Exception as e:
             logging.error("Error generating comprehensive report: %s", str(e))
 
+    def generate_performance_report(self) -> None:
+        print("\n" + "="*80)
+        print("VALIDATOR PERFORMANCE REPORT")
+        print("="*80)
+        
+        performance_stats = self.calculate_validator_performance_stats()
+        
+        if not performance_stats:
+            print("No performance data available")
+            return
+        
+        total_expected = sum(stats.expected_proposals for stats in performance_stats.values())
+        total_successful = sum(stats.successful_proposals for stats in performance_stats.values())
+        total_missed = sum(stats.missed_proposals for stats in performance_stats.values())
+        total_rewards = sum(stats.total_rewards_eth for stats in performance_stats.values())
+        
+        overall_success_rate = (total_successful / total_expected * 100) if total_expected > 0 else 0
+        
+        print(f"\nNetwork-wide Performance")
+        print(f"Total expected proposals: {total_expected:,}")
+        print(f"Successful proposals: {total_successful:,}")
+        print(f"Missed proposals: {total_missed:,}")
+        print(f"Overall success rate: {overall_success_rate:.2f}%")
+        print(f"Total rewards earned: {total_rewards:.6f} ETH")
+        if total_missed > 0:
+            avg_reward = total_rewards / total_successful if total_successful > 0 else 0
+            estimated_missed_value = avg_reward * total_missed
+            print(f"Estimated value of missed proposals: {estimated_missed_value:.6f} ETH")
+        
+        print(f"\nPerformance by Operator")
+        sorted_operators = sorted(
+            performance_stats.items(),
+            key=lambda x: x[1].expected_proposals,
+            reverse=True
+        )
+        
+        for operator, stats in sorted_operators:
+            if stats.expected_proposals == 0:
+                continue
+                
+            ens_name = self.validator_data.get('ens_names', {}).get(operator)
+            display_name = f"{ens_name} ({operator[:8]}...)" if ens_name else f"{operator[:8]}..."
+            
+            print(f"\n{display_name}")
+            print(f"  Expected proposals: {stats.expected_proposals}")
+            print(f"  Successful: {stats.successful_proposals} ({stats.success_rate:.2f}%)")
+            print(f"  Missed: {stats.missed_proposals} ({stats.miss_rate:.2f}%)")
+            print(f"  Total rewards: {stats.total_rewards_eth:.6f} ETH")
+            
+            if stats.successful_proposals > 0:
+                avg_reward = stats.total_rewards_eth / stats.successful_proposals
+                print(f"  Average reward per proposal: {avg_reward:.6f} ETH")
+                
+                if stats.missed_proposals > 0:
+                    estimated_lost = avg_reward * stats.missed_proposals
+                    print(f"  Estimated lost rewards: {estimated_lost:.6f} ETH")
+        
+        concerning_operators = [
+            (op, stats) for op, stats in performance_stats.items()
+            if stats.expected_proposals >= 5 and stats.miss_rate > 5.0
+        ]
+        
+        if concerning_operators:
+            print(f"\nOperators with High Miss Rates (>5%)")
+            concerning_operators.sort(key=lambda x: x[1].miss_rate, reverse=True)
+            
+            for operator, stats in concerning_operators:
+                ens_name = self.validator_data.get('ens_names', {}).get(operator)
+                display_name = f"{ens_name} ({operator[:8]}...)" if ens_name else f"{operator[:8]}..."
+                
+                print(f"{display_name}: {stats.miss_rate:.2f}% miss rate")
+                print(f"  {stats.missed_proposals}/{stats.expected_proposals} proposals missed")
+                
+                recent_missed = sorted(stats.missed_slots)[-5:]
+                if recent_missed:
+                    print(f"  Recent missed slots: {', '.join(map(str, recent_missed))}")
+        
+        missed_proposals = self.missed_proposals_cache.get('missed_proposals', [])
+        if missed_proposals:
+            print(f"\nRecent Missed Proposals")
+            recent_missed = sorted(missed_proposals, key=lambda x: x['slot'], reverse=True)[:10]
+            
+            for missed in recent_missed:
+                print(f"Slot {missed['slot']:,} ({missed['date']}): {missed['operator_name']}")
+
+    def comprehensive_scan_with_missed_proposals(self, max_slots: Optional[int] = None) -> dict:
+        print("Comprehensive Proposal Analysis")
+        print("Scanning for both successful and missed proposals...")
+        
+        successful_found = self.scan_proposals(max_slots)
+        missed_found, slots_checked = self.scan_for_missed_proposals()
+        
+        self.generate_comprehensive_report()
+        self.generate_performance_report()
+        
+        return {
+            'successful_proposals_found': successful_found,
+            'missed_proposals_found': missed_found,
+            'total_slots_checked': slots_checked
+        }
+
 
 def main():
-    """Main execution function."""
     eth_client_url = os.getenv('ETH_CLIENT_URL')
     beacon_api_url = os.getenv('BEACON_API_URL')
 
@@ -1265,16 +1485,16 @@ def main():
     if not beacon_api_url:
         raise ValueError("BEACON_API_URL environment variable is required")
 
-    print("Comprehensive NodeSet Block Proposal Tracker with Graffiti Analysis")
-    print("Consensus rewards: Local archive Lighthouse (beacon chain duties)")
-    print("Execution rewards: Beaconcha.in API (total execution layer rewards)")
-    print("MEV breakdown: Tracked separately within execution rewards")
-    print("Client identification: Graffiti analysis from beacon blocks")
-    print("Fallback: Local analysis if external APIs fail")
+    print("NodeSet Proposal Tracker with Missed Proposal Detection")
 
-    tracker = ComprehensiveProposalTracker(eth_client_url, beacon_api_url, enable_external_apis=True)
-    proposals_found = tracker.scan_proposals()
-    tracker.generate_comprehensive_report()
+    tracker = EnhancedProposalTracker(eth_client_url, beacon_api_url, enable_external_apis=True)
+    
+    results = tracker.comprehensive_scan_with_missed_proposals()
+    
+    print(f"\nFinal Summary")
+    print(f"Successful proposals found: {results['successful_proposals_found']}")
+    print(f"Missed proposals found: {results['missed_proposals_found']}")
+    print(f"Total slots analyzed: {results['total_slots_checked']:,}")
 
 
 if __name__ == "__main__":
