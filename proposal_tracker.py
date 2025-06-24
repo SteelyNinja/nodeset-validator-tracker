@@ -3,6 +3,10 @@ NodeSet Block Proposal Tracker with Missed Proposal Detection
 
 Tracks both successful and missed block proposals for NodeSet validators.
 Uses local Lighthouse + beaconcha.in API for comprehensive reward analysis.
+
+Enhanced with:
+- Delayed missed proposal checking to avoid false positives
+- Daily revalidation of missed proposals from last 24 hours
 """
 
 import os
@@ -11,6 +15,7 @@ import time
 import logging
 import requests
 import re
+import sys
 from collections import Counter, defaultdict
 from typing import Dict, List, Tuple, Set, Optional
 from web3 import Web3
@@ -203,6 +208,10 @@ class EnhancedProposalTracker:
         
         self.last_beaconchain_call = 0
         self.beaconchain_rate_limit = 0.1
+        
+        # Configuration for improved missed proposal detection
+        self.MIN_SLOT_AGE_FOR_MISSED_CHECK = 64  # Wait 64 slots (~12.8 minutes) before checking
+        self.MISSED_PROPOSAL_RECHECK_HOURS = 24  # Re-check proposals from last 24 hours
 
     def _setup_web3(self, eth_client_url: str) -> Web3:
         web3 = Web3(Web3.HTTPProvider(eth_client_url))
@@ -413,26 +422,68 @@ class EnhancedProposalTracker:
             return {}
 
     def _is_slot_missed(self, slot: int) -> bool:
+        """
+        Enhanced version of the original _is_slot_missed with better error handling
+        """
         try:
             response = requests.get(
                 f"{self.beacon_api_url}/eth/v2/beacon/blocks/{slot}",
-                timeout=10
+                timeout=15  # Increased timeout
             )
             
             if response.status_code == 404:
-                return True
+                # Double-check with headers endpoint to be sure
+                try:
+                    headers_response = requests.get(
+                        f"{self.beacon_api_url}/eth/v1/beacon/headers/{slot}",
+                        timeout=10
+                    )
+                    if headers_response.status_code == 200:
+                        logging.warning("Slot %d: Block endpoint returned 404 but headers found it", slot)
+                        return False  # Block exists
+                    elif headers_response.status_code == 404:
+                        return True  # Confirmed missed
+                except Exception as e:
+                    logging.debug("Headers check failed for slot %d: %s", slot, str(e))
+                
+                return True  # Assume missed if both endpoints say 404
+                
             elif response.status_code == 200:
-                return False
+                # Validate the response contains actual block data
+                try:
+                    block_data = response.json()
+                    if block_data and 'data' in block_data:
+                        return False  # Block found and valid
+                except Exception as e:
+                    logging.warning("Invalid block data for slot %d: %s", slot, str(e))
+                
+                return False  # Assume successful if we got 200
             else:
                 logging.debug("Unclear slot status for %d: HTTP %d", slot, response.status_code)
-                return False
+                return False  # Assume not missed for unclear responses
                 
         except requests.exceptions.Timeout:
-            logging.debug("Timeout checking slot %d", slot)
+            logging.debug("Timeout checking slot %d, assuming not missed", slot)
             return False
         except Exception as e:
-            logging.debug("Error checking slot %d: %s", slot, str(e))
+            logging.debug("Error checking slot %d: %s, assuming not missed", slot, str(e))
             return False
+
+    def _is_slot_missed_with_delay(self, slot: int) -> Optional[bool]:
+        """
+        Check if slot is missed, but only if enough time has passed.
+        Returns None if too early to check, True if missed, False if successful.
+        """
+        current_slot = self._get_current_slot()
+        slot_age = current_slot - slot
+        
+        # Don't check slots that are too recent
+        if slot_age < self.MIN_SLOT_AGE_FOR_MISSED_CHECK:
+            logging.debug("Slot %d too recent (age: %d slots), skipping missed check", slot, slot_age)
+            return None
+        
+        # Use existing logic for older slots
+        return self._is_slot_missed(slot)
 
     def _create_missed_proposal_record(self, slot: int, validator_index: int) -> MissedProposal:
         validator_info = self.tracked_validators[validator_index]
@@ -451,6 +502,94 @@ class EnhancedProposalTracker:
             operator_name=self._format_operator_name(validator_info),
             reason="missed_proposal"
         )
+
+    def daily_revalidation_of_missed_proposals(self) -> int:
+        """
+        Re-check missed proposals from the last 24 hours and remove false positives.
+        Should be run once daily.
+        """
+        print(f"\nDaily Re-validation of Missed Proposals")
+        print(f"Checking proposals marked as missed in the last {self.MISSED_PROPOSAL_RECHECK_HOURS} hours...")
+        
+        missed_proposals = self.missed_proposals_cache.get('missed_proposals', [])
+        
+        if not missed_proposals:
+            print("No missed proposals to re-validate")
+            return 0
+        
+        # Calculate cutoff time for last 24 hours
+        current_time = int(time.time())
+        cutoff_time = current_time - (self.MISSED_PROPOSAL_RECHECK_HOURS * 3600)
+        
+        # Find proposals from last 24 hours
+        recent_missed = [
+            mp for mp in missed_proposals 
+            if mp.get('timestamp', 0) >= cutoff_time
+        ]
+        
+        if not recent_missed:
+            print(f"No missed proposals from last {self.MISSED_PROPOSAL_RECHECK_HOURS} hours to re-validate")
+            return 0
+        
+        print(f"Re-validating {len(recent_missed)} missed proposals from last {self.MISSED_PROPOSAL_RECHECK_HOURS} hours...")
+        
+        false_positives = []
+        
+        for missed_proposal in recent_missed:
+            slot = missed_proposal['slot']
+            
+            # Re-check if this slot was actually missed
+            is_actually_missed = self._is_slot_missed(slot)
+            
+            if not is_actually_missed:
+                false_positives.append(slot)
+                operator_name = missed_proposal.get('operator_name', 'Unknown')
+                date = missed_proposal.get('date', 'Unknown')
+                print(f"  FALSE POSITIVE: Slot {slot} ({date}) - {operator_name} - REMOVING")
+                logging.info("Removed false positive missed proposal: slot %d, operator %s", 
+                           slot, operator_name)
+            else:
+                logging.debug("Confirmed missed proposal still missed: slot %d", slot)
+        
+        # Remove false positives from the cache
+        if false_positives:
+            original_count = len(missed_proposals)
+            self.missed_proposals_cache['missed_proposals'] = [
+                mp for mp in missed_proposals if mp['slot'] not in false_positives
+            ]
+            
+            # Update cache metadata
+            self.missed_proposals_cache['last_revalidation'] = current_time
+            self.missed_proposals_cache['last_revalidation_date'] = datetime.datetime.now().isoformat()
+            
+            self._save_missed_proposals_cache()
+            
+            new_count = len(self.missed_proposals_cache['missed_proposals'])
+            print(f"\nRevalidation Complete:")
+            print(f"  Proposals re-checked: {len(recent_missed)}")
+            print(f"  False positives removed: {len(false_positives)}")
+            print(f"  Total missed proposals: {original_count} -> {new_count}")
+            
+            return len(false_positives)
+        else:
+            print(f"All {len(recent_missed)} recent missed proposals confirmed as actually missed")
+            
+            # Still update revalidation timestamp
+            self.missed_proposals_cache['last_revalidation'] = current_time
+            self.missed_proposals_cache['last_revalidation_date'] = datetime.datetime.now().isoformat()
+            self._save_missed_proposals_cache()
+            
+            return 0
+
+    def should_run_daily_revalidation(self) -> bool:
+        """
+        Check if it's time to run daily revalidation
+        """
+        last_revalidation = self.missed_proposals_cache.get('last_revalidation', 0)
+        current_time = int(time.time())
+        
+        # Run if more than 24 hours since last revalidation
+        return (current_time - last_revalidation) > (24 * 3600)
 
     def _get_consensus_rewards_local(self, slot: int, validator_index: int) -> Tuple[int, dict]:
         try:
@@ -1103,6 +1242,9 @@ class EnhancedProposalTracker:
 
     def scan_for_missed_proposals(self, start_epoch: Optional[int] = None, 
                                  end_epoch: Optional[int] = None) -> Tuple[int, int]:
+        """
+        Enhanced version that waits for suitable period before checking missed proposals
+        """
         if start_epoch is None:
             start_epoch = max(
                 self.missed_proposals_cache.get('last_checked_epoch', 0),
@@ -1111,14 +1253,19 @@ class EnhancedProposalTracker:
         
         if end_epoch is None:
             current_slot = self._get_current_slot()
-            end_epoch = current_slot // SLOTS_PER_EPOCH
+            # Stop checking recent epochs to allow time for block propagation
+            # Go back enough epochs to ensure we're past the MIN_SLOT_AGE_FOR_MISSED_CHECK
+            slots_to_wait = self.MIN_SLOT_AGE_FOR_MISSED_CHECK
+            end_epoch = (current_slot - slots_to_wait) // SLOTS_PER_EPOCH
         
-        print(f"\nScanning for missed proposals")
+        print(f"\nScanning for missed proposals (with delay validation)")
         print(f"Epoch range: {start_epoch} to {end_epoch}")
+        print(f"Waiting {self.MIN_SLOT_AGE_FOR_MISSED_CHECK} slots ({self.MIN_SLOT_AGE_FOR_MISSED_CHECK * 12 / 60:.1f} min) before checking slots")
         print(f"Checking proposer duties for NodeSet validators...")
         
         missed_proposals_found = 0
         total_slots_checked = 0
+        slots_too_recent = 0
         existing_missed = list(self.missed_proposals_cache.get('missed_proposals', []))
         existing_slots = {mp['slot'] for mp in existing_missed}
         
@@ -1139,7 +1286,15 @@ class EnhancedProposalTracker:
                 if expected_proposer not in self.tracked_validators:
                     continue
                 
-                if self._is_slot_missed(slot):
+                # Check if slot is missed, but only if enough time has passed
+                missed_result = self._is_slot_missed_with_delay(slot)
+                
+                if missed_result is None:
+                    # Too recent to check reliably
+                    slots_too_recent += 1
+                    continue
+                elif missed_result:
+                    # Confirmed missed after waiting period
                     missed_proposal = self._create_missed_proposal_record(slot, expected_proposer)
                     
                     missed_dict = {
@@ -1151,16 +1306,18 @@ class EnhancedProposalTracker:
                         'validator_pubkey': missed_proposal.validator_pubkey,
                         'operator': missed_proposal.operator,
                         'operator_name': missed_proposal.operator_name,
-                        'reason': missed_proposal.reason
+                        'reason': missed_proposal.reason,
+                        'detection_method': 'delayed_validation'
                     }
                     
                     existing_missed.append(missed_dict)
                     missed_proposals_found += 1
                     
                     print(f"  MISSED: Slot {slot}, {missed_proposal.operator_name}")
-                    logging.info("Missed proposal: slot %d, validator %d, operator %s", 
+                    logging.info("Missed proposal (delayed validation): slot %d, validator %d, operator %s", 
                                slot, expected_proposer, missed_proposal.operator)
             
+            # Save progress periodically
             if epoch % 10 == 0:
                 self.missed_proposals_cache['missed_proposals'] = existing_missed
                 self.missed_proposals_cache['last_checked_epoch'] = epoch
@@ -1172,8 +1329,12 @@ class EnhancedProposalTracker:
         
         print(f"Missed proposal scan complete:")
         print(f"  Slots checked: {total_slots_checked:,}")
+        print(f"  Slots too recent to check: {slots_too_recent}")
         print(f"  New missed proposals found: {missed_proposals_found}")
         print(f"  Total missed proposals tracked: {len(existing_missed)}")
+        
+        if slots_too_recent > 0:
+            print(f"  Note: {slots_too_recent} recent slots will be checked in next scan")
         
         return missed_proposals_found, total_slots_checked
 
@@ -1459,8 +1620,21 @@ class EnhancedProposalTracker:
             for missed in recent_missed:
                 print(f"Slot {missed['slot']:,} ({missed['date']}): {missed['operator_name']}")
 
-    def comprehensive_scan_with_missed_proposals(self, max_slots: Optional[int] = None) -> dict:
-        print("Comprehensive Proposal Analysis")
+    def comprehensive_scan_with_missed_proposals(self, max_slots: Optional[int] = None, 
+                                               force_revalidation: bool = False) -> dict:
+        """
+        Enhanced comprehensive scan with automatic daily revalidation
+        """
+        print("Comprehensive Proposal Analysis with Enhanced Missed Detection")
+        
+        # Run daily revalidation if needed
+        if force_revalidation or self.should_run_daily_revalidation():
+            false_positives_removed = self.daily_revalidation_of_missed_proposals()
+        else:
+            last_revalidation = self.missed_proposals_cache.get('last_revalidation_date', 'Never')
+            print(f"Daily revalidation not needed (last run: {last_revalidation})")
+            false_positives_removed = 0
+        
         print("Scanning for both successful and missed proposals...")
         
         successful_found = self.scan_proposals(max_slots)
@@ -1472,7 +1646,8 @@ class EnhancedProposalTracker:
         return {
             'successful_proposals_found': successful_found,
             'missed_proposals_found': missed_found,
-            'total_slots_checked': slots_checked
+            'total_slots_checked': slots_checked,
+            'false_positives_removed': false_positives_removed
         }
 
 
@@ -1485,15 +1660,19 @@ def main():
     if not beacon_api_url:
         raise ValueError("BEACON_API_URL environment variable is required")
 
-    print("NodeSet Proposal Tracker with Missed Proposal Detection")
+    print("NodeSet Proposal Tracker with Enhanced Missed Proposal Detection")
 
     tracker = EnhancedProposalTracker(eth_client_url, beacon_api_url, enable_external_apis=True)
     
-    results = tracker.comprehensive_scan_with_missed_proposals()
+    # Option to force revalidation for testing
+    force_revalidation = '--force-revalidation' in sys.argv
+    
+    results = tracker.comprehensive_scan_with_missed_proposals(force_revalidation=force_revalidation)
     
     print(f"\nFinal Summary")
     print(f"Successful proposals found: {results['successful_proposals_found']}")
     print(f"Missed proposals found: {results['missed_proposals_found']}")
+    print(f"False positives removed: {results['false_positives_removed']}")
     print(f"Total slots analyzed: {results['total_slots_checked']:,}")
 
 
