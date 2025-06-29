@@ -351,6 +351,21 @@ class NodeSetValidatorTracker:
         slots_since_genesis = (current_time - GENESIS_TIME) // SECONDS_PER_SLOT
         return slots_since_genesis // SLOTS_PER_EPOCH
 
+    def _epoch_to_timestamp(self, epoch: int) -> int:
+        """Convert epoch number to Unix timestamp."""
+        if epoch is None or epoch == '18446744073709551615':  # Max uint64 used for "never"
+            return None
+        
+        try:
+            epoch_int = int(epoch)
+            # Calculate slot number from epoch
+            slot = epoch_int * SLOTS_PER_EPOCH
+            # Calculate timestamp from slot
+            timestamp = GENESIS_TIME + (slot * SECONDS_PER_SLOT)
+            return timestamp
+        except (ValueError, TypeError):
+            return None
+
     def _analyze_transaction(self, tx_receipt: dict) -> Tuple[Optional[str], int]:
         """Analyze transaction for validator deposits."""
         try:
@@ -396,8 +411,8 @@ class NodeSetValidatorTracker:
 
         return has_vault_logs and is_multicall
 
-    def _check_validator_exits(self, tracked_indices: Set[int]) -> Dict[int, str]:
-        """Check validator exit status via beacon API."""
+    def _check_validator_exits(self, tracked_indices: Set[int]) -> Dict[int, dict]:
+        """Check validator exit status via beacon API with detailed exit information."""
         if not self.beacon_api_url or not tracked_indices:
             return {}
 
@@ -419,11 +434,29 @@ class NodeSetValidatorTracker:
                     for validator in data.get('data', []):
                         index = int(validator['index'])
                         status = validator['status']
+                        val_data = validator.get('validator', {})
 
                         if status in ['exited_unslashed', 'exited_slashed',
                                      'withdrawal_possible', 'withdrawal_done']:
-                            exited_validators[index] = status
-                            logging.info("Validator %d status: %s", index, status)
+                            
+                            # Get exit epoch and calculate timestamp
+                            exit_epoch = val_data.get('exit_epoch')
+                            withdrawable_epoch = val_data.get('withdrawable_epoch')
+                            
+                            exit_info = {
+                                'status': status,
+                                'exit_epoch': exit_epoch,
+                                'withdrawable_epoch': withdrawable_epoch,
+                                'exit_timestamp': self._epoch_to_timestamp(exit_epoch) if exit_epoch and exit_epoch != '18446744073709551615' else None,
+                                'withdrawable_timestamp': self._epoch_to_timestamp(withdrawable_epoch) if withdrawable_epoch and withdrawable_epoch != '18446744073709551615' else None,
+                                'balance': val_data.get('balance'),
+                                'effective_balance': val_data.get('effective_balance'),
+                                'slashed': val_data.get('slashed', False)
+                            }
+                            
+                            exited_validators[index] = exit_info
+                            logging.info("Validator %d exit details: status=%s, exit_epoch=%s, timestamp=%s", 
+                                       index, status, exit_epoch, exit_info.get('exit_timestamp'))
 
                 # Rate limiting
                 if i + batch_size < len(validator_list):
@@ -778,20 +811,40 @@ class NodeSetValidatorTracker:
 
                 new_exits = 0
                 exited_pubkeys = set(self.cache.get('exited_pubkeys', []))
+                exit_details = self.cache.get('exit_details', {})
 
                 for pubkey, index in validator_indices.items():
                     if index in exited_statuses and pubkey not in exited_pubkeys:
                         for operator, pubkeys in operator_pubkeys.items():
                             if pubkey in pubkeys:
-                                status = exited_statuses[index]
+                                exit_info = exited_statuses[index]
                                 operator_exited[operator] += 1
                                 new_exits += 1
                                 exited_pubkeys.add(pubkey)
+                                
+                                # Store detailed exit information
+                                exit_details[pubkey] = {
+                                    'validator_index': index,
+                                    'operator': operator,
+                                    'operator_name': self.format_operator_display(operator),
+                                    'status': exit_info['status'],
+                                    'exit_epoch': exit_info['exit_epoch'],
+                                    'exit_timestamp': exit_info['exit_timestamp'],
+                                    'withdrawable_epoch': exit_info['withdrawable_epoch'],
+                                    'withdrawable_timestamp': exit_info['withdrawable_timestamp'],
+                                    'balance': exit_info['balance'],
+                                    'effective_balance': exit_info['effective_balance'],
+                                    'slashed': exit_info['slashed'],
+                                    'discovered_timestamp': int(time.time())
+                                }
+                                
                                 display_name = self.format_operator_display(operator)
-                                print(f"Exit: Validator {index} ({display_name}) - {status}")
+                                timestamp_str = datetime.datetime.fromtimestamp(exit_info['exit_timestamp']).strftime('%Y-%m-%d %H:%M:%S') if exit_info['exit_timestamp'] else 'Unknown'
+                                print(f"Exit: Validator {index} ({display_name}) - {exit_info['status']} at {timestamp_str}")
                                 break
 
                 self.cache['exited_pubkeys'] = list(exited_pubkeys)
+                self.cache['exit_details'] = exit_details
 
                 if new_exits == 0:
                     print("All exits previously tracked")
@@ -827,7 +880,7 @@ class NodeSetValidatorTracker:
             # Return existing performance data from cache
             return list(self.cache.get('operator_performance', {}).items())
         
-        print("Performance data is stale (>6 hours), fetching fresh data from beaconcha.in...")
+        print("Performance data is stale (>1 hour), fetching fresh data from beaconcha.in...")
         logging.info("Starting performance check - last update was %d hours ago", 
                     (current_time - last_performance_update) // 3600)
         
@@ -1043,6 +1096,104 @@ class NodeSetValidatorTracker:
                     source = " (manual)" if is_manual else " (on-chain)"
                     print(f"  {name}{source} ({addr[:8]}...{addr[-6:]}): {validator_count} validators")
 
+    def generate_dashboard_exit_data(self) -> dict:
+        """Generate dashboard-friendly exit data with timestamps and details."""
+        exit_details = self.cache.get('exit_details', {})
+        operator_validators = self.cache.get('operator_validators', {})
+        operator_exited = self.cache.get('exited_validators', {})
+        
+        dashboard_data = {
+            'exit_summary': {
+                'total_exited': sum(operator_exited.values()),
+                'total_active': sum(operator_validators.values()) - sum(operator_exited.values()),
+                'exit_rate_percent': (sum(operator_exited.values()) / sum(operator_validators.values()) * 100) if sum(operator_validators.values()) > 0 else 0,
+                'last_updated': int(time.time())
+            },
+            'operators_with_exits': [],
+            'recent_exits': [],
+            'exit_timeline': []
+        }
+        
+        # Operators with exits table data
+        for operator, exit_count in operator_exited.items():
+            if exit_count > 0:
+                total_ever = operator_validators.get(operator, 0)
+                still_active = total_ever - exit_count
+                exit_rate = (exit_count / total_ever * 100) if total_ever > 0 else 0
+                
+                # Find most recent exit for this operator
+                operator_exits = [exit_info for pubkey, exit_info in exit_details.items() 
+                                if exit_info['operator'] == operator]
+                latest_exit_timestamp = None
+                if operator_exits:
+                    latest_exit_timestamp = max([exit['exit_timestamp'] for exit in operator_exits 
+                                               if exit['exit_timestamp']])
+                
+                operator_data = {
+                    'operator': operator,
+                    'operator_name': self.format_operator_display(operator),
+                    'exits': exit_count,
+                    'still_active': still_active,
+                    'total_ever': total_ever,
+                    'exit_rate': round(exit_rate, 1),
+                    'latest_exit_timestamp': latest_exit_timestamp,
+                    'latest_exit_date': datetime.datetime.fromtimestamp(latest_exit_timestamp).strftime('%Y-%m-%d') if latest_exit_timestamp else 'Data not available'
+                }
+                
+                dashboard_data['operators_with_exits'].append(operator_data)
+        
+        # Sort by exit count descending
+        dashboard_data['operators_with_exits'].sort(key=lambda x: x['exits'], reverse=True)
+        
+        # Recent exits (last 30 days)
+        thirty_days_ago = int(time.time()) - (30 * 24 * 60 * 60)
+        recent_exits = []
+        
+        for pubkey, exit_info in exit_details.items():
+            if exit_info.get('exit_timestamp') and exit_info['exit_timestamp'] > thirty_days_ago:
+                recent_exits.append({
+                    'validator_index': exit_info['validator_index'],
+                    'operator': exit_info['operator'],
+                    'operator_name': exit_info['operator_name'],
+                    'exit_timestamp': exit_info['exit_timestamp'],
+                    'exit_date': datetime.datetime.fromtimestamp(exit_info['exit_timestamp']).strftime('%Y-%m-%d %H:%M:%S'),
+                    'status': exit_info['status'],
+                    'slashed': exit_info.get('slashed', False),
+                    'balance_gwei': exit_info.get('balance'),
+                    'exit_epoch': exit_info.get('exit_epoch')
+                })
+        
+        # Sort by timestamp descending (most recent first)
+        recent_exits.sort(key=lambda x: x['exit_timestamp'], reverse=True)
+        dashboard_data['recent_exits'] = recent_exits[:50]  # Limit to 50 most recent
+        
+        # Exit timeline for charts (group by day)
+        exit_timeline = defaultdict(lambda: {'voluntary': 0, 'slashed': 0, 'total': 0})
+        
+        for exit_info in exit_details.values():
+            if exit_info.get('exit_timestamp'):
+                exit_date = datetime.datetime.fromtimestamp(exit_info['exit_timestamp']).strftime('%Y-%m-%d')
+                if exit_info.get('slashed'):
+                    exit_timeline[exit_date]['slashed'] += 1
+                else:
+                    exit_timeline[exit_date]['voluntary'] += 1
+                exit_timeline[exit_date]['total'] += 1
+        
+        # Convert to list and sort by date
+        timeline_list = []
+        for date, counts in exit_timeline.items():
+            timeline_list.append({
+                'date': date,
+                'voluntary_exits': counts['voluntary'],
+                'slashed_exits': counts['slashed'],
+                'total_exits': counts['total']
+            })
+        
+        timeline_list.sort(key=lambda x: x['date'])
+        dashboard_data['exit_timeline'] = timeline_list
+        
+        return dashboard_data
+
     def run_analysis(self) -> None:
         """Execute complete validator analysis with ENS resolution."""
         try:
@@ -1082,7 +1233,17 @@ class NodeSetValidatorTracker:
             # Generate report
             self.generate_report(operator_validators, operator_exited,
                                total_validators, total_exited, operator_performance)
-
+            
+            # Generate dashboard data with detailed exit information
+            print("\nGenerating dashboard data...")
+            dashboard_data = self.generate_dashboard_exit_data()
+            
+            # Save dashboard data to JSON file
+            dashboard_file = "dashboard_exit_data.json"
+            with open(dashboard_file, 'w') as f:
+                json.dump(dashboard_data, f, indent=2)
+            print(f"Dashboard data saved to {dashboard_file}")
+            
             logging.info("Analysis completed successfully")
 
         except Exception as e:
