@@ -13,6 +13,9 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import os
+import fcntl
+import tempfile
+import shutil
 
 # Configure logging
 logging.basicConfig(
@@ -45,11 +48,21 @@ class ValidatorPerformanceTracker:
     def load_cache(self) -> Dict:
         """Load existing performance cache or create new structure"""
         if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.warning(f"Could not load cache file: {e}. Starting fresh.")
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    with open(self.cache_file, 'r') as f:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_SH)  # Shared lock for reading
+                        return json.load(f)
+                except (json.JSONDecodeError, OSError) as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"JSON parse error on attempt {attempt + 1}: {e}. Retrying...")
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                    else:
+                        logger.warning(f"Could not load cache file after {max_retries} attempts: {e}. Starting fresh.")
+                except Exception as e:
+                    logger.warning(f"Could not load cache file: {e}. Starting fresh.")
+                    break
         
         return {
             "last_updated": None,
@@ -58,13 +71,28 @@ class ValidatorPerformanceTracker:
         }
     
     def save_cache(self):
-        """Save performance cache to file"""
+        """Save performance cache to file using atomic write"""
         self.cache["last_updated"] = datetime.now(timezone.utc).isoformat()
         
-        with open(self.cache_file, 'w') as f:
-            json.dump(self.cache, f, indent=2)
-        
-        logger.info(f"Saved performance data to {self.cache_file}")
+        # Write to temporary file first (atomic write)
+        temp_file = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(self.cache_file), 
+                                           prefix=os.path.basename(self.cache_file) + '.tmp', 
+                                           delete=False) as f:
+                temp_file = f.name
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)  # Exclusive lock for writing
+                json.dump(self.cache, f, indent=2)
+            
+            # Atomically replace the original file
+            shutil.move(temp_file, self.cache_file)
+            logger.info(f"Saved performance data to {self.cache_file}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save cache: {e}")
+            if temp_file and os.path.exists(temp_file):
+                os.unlink(temp_file)
+            raise
     
     def load_nodeset_validators(self) -> Dict[str, List[str]]:
         """Load validator pubkeys from the main NodeSet tracker cache"""
@@ -73,8 +101,19 @@ class ValidatorPerformanceTracker:
         if not os.path.exists(cache_file):
             raise FileNotFoundError(f"NodeSet validator cache not found: {cache_file}")
         
-        with open(cache_file, 'r') as f:
-            data = json.load(f)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with open(cache_file, 'r') as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)  # Shared lock for reading
+                    data = json.load(f)
+                break
+            except (json.JSONDecodeError, OSError) as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"JSON parse error loading NodeSet cache on attempt {attempt + 1}: {e}. Retrying...")
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    raise
         
         if 'validator_pubkeys' not in data:
             raise ValueError("No validator_pubkeys found in NodeSet cache")
@@ -88,8 +127,19 @@ class ValidatorPerformanceTracker:
         if not os.path.exists(cache_file):
             raise FileNotFoundError(f"NodeSet validator cache not found: {cache_file}")
         
-        with open(cache_file, 'r') as f:
-            data = json.load(f)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with open(cache_file, 'r') as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)  # Shared lock for reading
+                    data = json.load(f)
+                break
+            except (json.JSONDecodeError, OSError) as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"JSON parse error loading validator data on attempt {attempt + 1}: {e}. Retrying...")
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    raise
         
         if 'validator_indices' not in data:
             raise ValueError("No validator_indices found in NodeSet cache")

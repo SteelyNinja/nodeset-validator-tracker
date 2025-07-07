@@ -147,6 +147,7 @@ class NodeSetValidatorTracker:
             'cost_last_updated': 0,
             # ENS-related cache entries
             'ens_names': {},
+            'ens_sources': {},  # Track source of ENS names (manual/on-chain)
             'ens_last_updated': 0,
             'ens_update_failures': {}
         }
@@ -163,13 +164,14 @@ class NodeSetValidatorTracker:
         except Exception as e:
             logging.error("Error saving cache: %s", str(e))
 
-    def _resolve_ens_name(self, address: str) -> Optional[str]:
-        """Resolve ENS name for an Ethereum address, checking manual override first."""
+    def _resolve_ens_name(self, address: str) -> tuple[Optional[str], Optional[str]]:
+        """Resolve ENS name for an Ethereum address, checking manual override first.
+        Returns (name, source) where source is 'manual' or 'on-chain'."""
         normalized_address = address.lower()
         if normalized_address in self.manual_ens_names:
             manual_name = self.manual_ens_names[normalized_address]
             logging.info("Using manual ENS name: %s -> %s", address[:10], manual_name)
-            return manual_name
+            return manual_name, 'manual'
 
         try:
             checksum_address = self.web3.to_checksum_address(address.lower())
@@ -177,14 +179,14 @@ class NodeSetValidatorTracker:
 
             if ens_name:
                 logging.info("Resolved on-chain ENS: %s -> %s", address[:10], ens_name)
-                return ens_name
+                return ens_name, 'on-chain'
             else:
                 logging.debug("No on-chain ENS name found for %s", address[:10])
-                return None
+                return None, None
 
         except Exception as e:
             logging.debug("On-chain ENS resolution failed for %s: %s", address[:10], str(e))
-            return None
+            return None, None
 
     def _update_ens_names(self) -> None:
         """Update ENS names for all operator addresses."""
@@ -193,6 +195,7 @@ class NodeSetValidatorTracker:
 
         operator_validators = self.cache.get('operator_validators', {})
         ens_names = self.cache.get('ens_names', {})
+        ens_sources = self.cache.get('ens_sources', {})
         ens_failures = self.cache.get('ens_update_failures', {})
 
         operator_addresses = list(operator_validators.keys())
@@ -208,6 +211,7 @@ class NodeSetValidatorTracker:
 
         updated_count = 0
         manual_count = 0
+        onchain_count = 0
         failed_count = 0
 
         for i, address in enumerate(operator_addresses):
@@ -215,14 +219,17 @@ class NodeSetValidatorTracker:
                 normalized_address = address.lower()
                 print(f"Resolving ENS for operator {i+1}/{len(operator_addresses)}: {address[:10]}...")
 
-                ens_name = self._resolve_ens_name(address)
+                ens_name, source = self._resolve_ens_name(address)
 
-                if ens_name:
+                if ens_name and source:
                     ens_names[address] = ens_name
+                    ens_sources[address] = source
                     updated_count += 1
                     
-                    if normalized_address in self.manual_ens_names:
+                    if source == 'manual':
                         manual_count += 1
+                    else:
+                        onchain_count += 1
                     
                     if address in ens_failures:
                         del ens_failures[address]
@@ -236,7 +243,7 @@ class NodeSetValidatorTracker:
 
                 # Progress update every 10 addresses
                 if (i + 1) % 10 == 0:
-                    print(f"Progress: {i+1}/{len(operator_addresses)} ({updated_count} found, {manual_count} manual)")
+                    print(f"Progress: {i+1}/{len(operator_addresses)} ({updated_count} found, {manual_count} manual, {onchain_count} on-chain)")
 
             except Exception as e:
                 logging.error("Error resolving ENS for %s: %s", address[:10], str(e))
@@ -249,13 +256,14 @@ class NodeSetValidatorTracker:
         # Update cache
         self.cache.update({
             'ens_names': ens_names,
+            'ens_sources': ens_sources,
             'ens_last_updated': current_time,
             'ens_update_failures': ens_failures
         })
 
-        print(f"ENS update complete: {updated_count} names found ({manual_count} manual, {updated_count - manual_count} on-chain), {failed_count} failed")
+        print(f"ENS update complete: {updated_count} names found ({manual_count} manual, {onchain_count} on-chain), {failed_count} failed")
         logging.info("ENS update completed: %d names resolved (%d manual, %d on-chain), %d failed, %d total cached",
-                    updated_count, manual_count, updated_count - manual_count, failed_count, len(ens_names))
+                    updated_count, manual_count, onchain_count, failed_count, len(ens_names))
 
     def get_ens_name(self, address: str) -> Optional[str]:
         """Get ENS name for an address from cache."""
@@ -1080,10 +1088,16 @@ class NodeSetValidatorTracker:
 
         # ENS Summary
         ens_names = self.cache.get('ens_names', {})
+        ens_sources = self.cache.get('ens_sources', {})
         if ens_names:
+            # Count sources
+            manual_count = sum(1 for source in ens_sources.values() if source == 'manual')
+            onchain_count = sum(1 for source in ens_sources.values() if source == 'on-chain')
+            
             print(f"\n=== ENS NAMES RESOLVED ===")
             print(f"Total ENS names found: {len(ens_names)}")
-            print(f"Manual ENS mappings loaded: {len(self.manual_ens_names)}")
+            print(f"Manual ENS mappings: {manual_count}")
+            print(f"On-chain ENS lookups: {onchain_count}")
             print(f"ENS coverage: {len(ens_names)}/{len(operator_validators)} operators ({len(ens_names)/len(operator_validators)*100:.1f}%)")
 
             # Show operators with ENS names
@@ -1092,15 +1106,21 @@ class NodeSetValidatorTracker:
                 print("\nOperators with ENS names:")
                 for addr, name in sorted(ens_operators, key=lambda x: operator_validators.get(x[0], 0), reverse=True)[:10]:
                     validator_count = operator_validators.get(addr, 0)
-                    is_manual = addr.lower() in self.manual_ens_names
-                    source = " (manual)" if is_manual else " (on-chain)"
-                    print(f"  {name}{source} ({addr[:8]}...{addr[-6:]}): {validator_count} validators")
+                    source = ens_sources.get(addr, 'unknown')
+                    source_label = f" ({source})" if source != 'unknown' else " (unknown)"
+                    print(f"  {name}{source_label} ({addr[:8]}...{addr[-6:]}): {validator_count} validators")
 
     def generate_dashboard_exit_data(self) -> dict:
         """Generate dashboard-friendly exit data with timestamps and details."""
         exit_details = self.cache.get('exit_details', {})
         operator_validators = self.cache.get('operator_validators', {})
         operator_exited = self.cache.get('exited_validators', {})
+        ens_names = self.cache.get('ens_names', {})
+        ens_sources = self.cache.get('ens_sources', {})
+        
+        # Count ENS sources
+        manual_count = sum(1 for source in ens_sources.values() if source == 'manual')
+        onchain_count = sum(1 for source in ens_sources.values() if source == 'on-chain')
         
         dashboard_data = {
             'exit_summary': {
@@ -1108,6 +1128,12 @@ class NodeSetValidatorTracker:
                 'total_active': sum(operator_validators.values()) - sum(operator_exited.values()),
                 'exit_rate_percent': (sum(operator_exited.values()) / sum(operator_validators.values()) * 100) if sum(operator_validators.values()) > 0 else 0,
                 'last_updated': int(time.time())
+            },
+            'ens_summary': {
+                'total_ens_names': len(ens_names),
+                'manual_ens_count': manual_count,
+                'onchain_ens_count': onchain_count,
+                'ens_coverage_percent': (len(ens_names) / len(operator_validators) * 100) if len(operator_validators) > 0 else 0
             },
             'operators_with_exits': [],
             'recent_exits': [],
