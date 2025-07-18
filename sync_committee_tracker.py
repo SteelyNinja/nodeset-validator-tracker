@@ -636,6 +636,12 @@ class NodeSetSyncCommitteeTracker:
             print(f"  Scan slots: {scan_start:,} to {scan_end:,}")
             print(f"  Our validators: {len(committee['our_validators'])}")
 
+            # FIXED: Check if this period is already fully scanned to prevent double-counting
+            if self._is_period_fully_scanned(period, detailed_stats):
+                print(f"  Period {period} already fully scanned - skipping to prevent double-counting")
+                periods_processed.add(period)
+                continue
+
             # Initialize or load existing stats for this period
             period_stats = {}
             for val_idx in committee['our_validators']:
