@@ -48,12 +48,18 @@ class NodeSetValidatorTracker:
     Now includes ENS name resolution, caching, and manual ENS override support.
     """
 
-    def __init__(self, eth_client_url: str, beacon_api_url: Optional[str] = None, etherscan_api_key: Optional[str] = None):
+    def __init__(self, eth_client_url: str, beacon_api_url: Optional[str] = None, etherscan_api_key: Optional[str] = None, 
+                 clickhouse_host: str = "192.168.202.250", clickhouse_port: int = 8123):
         self.web3 = self._setup_web3(eth_client_url)
         self.beacon_api_url = self._setup_beacon_api(beacon_api_url)
         self.etherscan_api_key = etherscan_api_key
         self.manual_ens_names = self._load_manual_ens_names()
         self.cache = self._load_cache()
+        
+        # ClickHouse configuration
+        self.clickhouse_host = clickhouse_host
+        self.clickhouse_port = clickhouse_port
+        self.clickhouse_url = f"http://{clickhouse_host}:{clickhouse_port}/"
 
     def _setup_web3(self, eth_client_url: str) -> Web3:
         """Initialize Web3 connection."""
@@ -1110,6 +1116,128 @@ class NodeSetValidatorTracker:
                     source_label = f" ({source})" if source != 'unknown' else " (unknown)"
                     print(f"  {name}{source_label} ({addr[:8]}...{addr[-6:]}): {validator_count} validators")
 
+    def query_clickhouse_active_exiting(self, validator_indices: List[int]) -> List[Dict]:
+        """Query ClickHouse for validators in active_exiting state"""
+        if not validator_indices:
+            return []
+        
+        indices_str = ','.join(map(str, validator_indices))
+        query = f"""
+        SELECT 
+            val_id,
+            val_status,
+            epoch,
+            val_balance
+        FROM default.validators_summary 
+        WHERE val_id IN ({indices_str})
+            AND val_status = 'active_exiting'
+            AND epoch = (SELECT MAX(epoch) FROM default.validators_summary)
+        """
+        
+        try:
+            logging.info("Querying ClickHouse for active_exiting validators")
+            response = requests.post(self.clickhouse_url, data=query, timeout=30)
+            response.raise_for_status()
+            
+            results = []
+            for line in response.text.strip().split('\n'):
+                if line:
+                    parts = line.split('\t')
+                    if len(parts) >= 4:
+                        results.append({
+                            'validator_index': int(parts[0]),
+                            'status': parts[1],
+                            'epoch': int(parts[2]),
+                            'balance': int(parts[3]) if parts[3] != '\\N' else None
+                        })
+            
+            logging.info("Found %d validators in active_exiting state from ClickHouse", len(results))
+            return results
+            
+        except Exception as e:
+            logging.error("Error querying ClickHouse for active_exiting validators: %s", str(e))
+            return []
+    
+    def track_active_exiting_validators(self):
+        """Track validators in active_exiting state and store in cache"""
+        validator_indices = self.cache.get('validator_indices', {})
+        if not validator_indices:
+            logging.warning("No validator indices available for active_exiting check")
+            return
+        
+        # Get list of validator indices
+        indices_list = list(validator_indices.values())
+        
+        # Query ClickHouse for active_exiting validators
+        active_exiting_data = self.query_clickhouse_active_exiting(indices_list)
+        
+        if not active_exiting_data:
+            print("No validators found in active_exiting state")
+            return
+        
+        print(f"Found {len(active_exiting_data)} validators in active_exiting state")
+        
+        # Initialize active_exiting_details if not exists
+        if 'active_exiting_details' not in self.cache:
+            self.cache['active_exiting_details'] = {}
+        
+        # Get reverse mapping of index -> pubkey
+        index_to_pubkey = {v: k for k, v in validator_indices.items()}
+        
+        # Process each active_exiting validator
+        for validator_data in active_exiting_data:
+            validator_index = validator_data['validator_index']
+            epoch = validator_data['epoch']
+            balance = validator_data['balance']
+            
+            # Find pubkey for this validator index
+            pubkey = index_to_pubkey.get(validator_index)
+            if not pubkey:
+                logging.warning("No pubkey found for validator index %d", validator_index)
+                continue
+            
+            # Find operator for this pubkey
+            operator = None
+            for op, pubkeys in self.cache.get('validator_pubkeys', {}).items():
+                if pubkey in pubkeys:
+                    operator = op
+                    break
+            
+            if not operator:
+                logging.warning("No operator found for validator %d (pubkey %s)", validator_index, pubkey[:20])
+                continue
+            
+            # Get operator name
+            operator_name = self.format_operator_display(operator)
+            
+            # Store active_exiting data
+            self.cache['active_exiting_details'][pubkey] = {
+                'validator_index': validator_index,
+                'operator': operator,
+                'operator_name': operator_name,
+                'status': 'active_exiting',
+                'active_exiting_epoch': epoch,
+                'active_exiting_timestamp': self._epoch_to_timestamp(epoch),
+                'balance': balance,
+                'discovered_timestamp': int(time.time())
+            }
+            
+            logging.info("Stored active_exiting data for validator %d (operator %s)", 
+                        validator_index, operator_name)
+        
+        # Update cache counts
+        self.cache['total_active_exiting'] = len(self.cache['active_exiting_details'])
+        
+        # Save updated cache
+        self._save_cache()
+        
+        print(f"Stored {len(active_exiting_data)} active_exiting validators in cache")
+        logging.info("Active exiting tracking completed: %d validators tracked", len(active_exiting_data))
+    
+    def _epoch_to_timestamp(self, epoch: int) -> int:
+        """Convert beacon chain epoch to Unix timestamp"""
+        return GENESIS_TIME + (epoch * SLOTS_PER_EPOCH * SECONDS_PER_SLOT)
+
     def generate_dashboard_exit_data(self) -> dict:
         """Generate dashboard-friendly exit data with timestamps and details."""
         exit_details = self.cache.get('exit_details', {})
@@ -1269,6 +1397,10 @@ class NodeSetValidatorTracker:
             with open(dashboard_file, 'w') as f:
                 json.dump(dashboard_data, f, indent=2)
             print(f"Dashboard data saved to {dashboard_file}")
+            
+            # Check ClickHouse for active_exiting validators
+            print("\nChecking for active_exiting validators...")
+            self.track_active_exiting_validators()
             
             logging.info("Analysis completed successfully")
 

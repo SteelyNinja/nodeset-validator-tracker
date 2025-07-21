@@ -177,6 +177,7 @@ class ValidatorPerformanceTracker:
         timestamp = self.epoch_to_timestamp(epoch)
         return datetime.fromtimestamp(timestamp, tz=timezone.utc)
     
+    
     def fetch_validator_info_batch(self, validator_indices: List[int]) -> Optional[List[Dict]]:
         """Fetch basic validator info including activation data for a batch of validators"""
         if not validator_indices:
@@ -348,6 +349,7 @@ class ValidatorPerformanceTracker:
                 }
                 existing_record['last_updated'] = datetime.now(timezone.utc).isoformat()
     
+    
     def run_performance_collection(self):
         """Main function to collect performance data for all validators"""
         logger.info("Starting intelligent validator performance collection")
@@ -434,6 +436,7 @@ class ValidatorPerformanceTracker:
                 
                 # Rate limiting for 1 API call per batch (faster for existing)
                 time.sleep(0.8)
+        
         
         # Final save
         self.save_cache()
