@@ -426,59 +426,75 @@ class NodeSetValidatorTracker:
         return has_vault_logs and is_multicall
 
     def _check_validator_exits(self, tracked_indices: Set[int]) -> Dict[int, dict]:
-        """Check validator exit status via beacon API with detailed exit information."""
-        if not self.beacon_api_url or not tracked_indices:
+        """Check validator exit status via ClickHouse database with detailed exit information."""
+        if not tracked_indices:
             return {}
 
         exited_validators = {}
-        batch_size = 50
-        validator_list = list(tracked_indices)
-
-        for i in range(0, len(validator_list), batch_size):
-            batch = validator_list[i:i + batch_size]
-            try:
-                validator_ids = ','.join(map(str, batch))
-                response = requests.get(
-                    f"{self.beacon_api_url}/eth/v1/beacon/states/head/validators?id={validator_ids}",
-                    timeout=30
-                )
-
-                if response.status_code == 200:
-                    data = response.json()
-                    for validator in data.get('data', []):
-                        index = int(validator['index'])
-                        status = validator['status']
-                        val_data = validator.get('validator', {})
-
-                        if status in ['exited_unslashed', 'exited_slashed',
-                                     'withdrawal_possible', 'withdrawal_done']:
+        indices_list = list(tracked_indices)
+        
+        # Query ClickHouse for validator statuses
+        indices_str = ','.join(map(str, indices_list))
+        query = f"""
+        SELECT 
+            val_id,
+            val_status,
+            epoch,
+            val_balance,
+            val_effective_balance,
+            val_slashed
+        FROM default.validators_summary 
+        WHERE val_id IN ({indices_str})
+            AND epoch = (SELECT MAX(epoch) FROM default.validators_summary)
+            AND val_status IN ('exited_unslashed', 'exited_slashed', 
+                              'withdrawal_possible', 'withdrawal_done')
+        """
+        
+        try:
+            logging.info("Querying ClickHouse for validator exit statuses")
+            response = requests.post(
+                self.clickhouse_url, 
+                data=query,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                lines = response.text.strip().split('\n')
+                if lines and lines[0]:  # Check if we have results
+                    for line in lines:
+                        parts = line.split('\t')
+                        if len(parts) >= 6:
+                            val_id = int(parts[0])
+                            status = parts[1]
+                            epoch = int(parts[2])
+                            balance = int(parts[3]) if parts[3] != '\\N' else None
+                            effective_balance = int(parts[4]) if parts[4] != '\\N' else None
+                            slashed = bool(int(parts[5])) if parts[5] != '\\N' else False
                             
-                            # Get exit epoch and calculate timestamp
-                            exit_epoch = val_data.get('exit_epoch')
-                            withdrawable_epoch = val_data.get('withdrawable_epoch')
-                            
+                            # For ClickHouse data, we don't have separate exit/withdrawable epochs
+                            # We'll use the current epoch as a placeholder for exit epoch
                             exit_info = {
                                 'status': status,
-                                'exit_epoch': exit_epoch,
-                                'withdrawable_epoch': withdrawable_epoch,
-                                'exit_timestamp': self._epoch_to_timestamp(exit_epoch) if exit_epoch and exit_epoch != '18446744073709551615' else None,
-                                'withdrawable_timestamp': self._epoch_to_timestamp(withdrawable_epoch) if withdrawable_epoch and withdrawable_epoch != '18446744073709551615' else None,
-                                'balance': val_data.get('balance'),
-                                'effective_balance': val_data.get('effective_balance'),
-                                'slashed': val_data.get('slashed', False)
+                                'exit_epoch': epoch,  # Current epoch from data
+                                'withdrawable_epoch': None,  # Not available in ClickHouse
+                                'exit_timestamp': self._epoch_to_timestamp(epoch),
+                                'withdrawable_timestamp': None,
+                                'balance': balance,
+                                'effective_balance': effective_balance,
+                                'slashed': slashed
                             }
                             
-                            exited_validators[index] = exit_info
-                            logging.info("Validator %d exit details: status=%s, exit_epoch=%s, timestamp=%s", 
-                                       index, status, exit_epoch, exit_info.get('exit_timestamp'))
-
-                # Rate limiting
-                if i + batch_size < len(validator_list):
-                    time.sleep(0.1)
-
-            except Exception as e:
-                logging.debug("Error checking validator batch: %s", str(e))
-                continue
+                            exited_validators[val_id] = exit_info
+                            logging.info("Validator %d exit details from ClickHouse: status=%s, epoch=%s", 
+                                       val_id, status, epoch)
+                
+                logging.info("Found %d exited validators from ClickHouse", len(exited_validators))
+            else:
+                logging.error("ClickHouse query failed with status %d", response.status_code)
+                
+        except Exception as e:
+            logging.error("Error querying ClickHouse for validator exits: %s", str(e))
+            return {}
 
         return exited_validators
 
@@ -743,7 +759,7 @@ class NodeSetValidatorTracker:
 
         operator_pubkeys = defaultdict(list, self.cache.get('validator_pubkeys', {}))
         validator_indices = dict(self.cache.get('validator_indices', {}))
-        operator_exited = defaultdict(int, self.cache.get('exited_validators', {}))
+        operator_exited = defaultdict(int, self.cache.get('operator_exited', {}))
         total_exited = self.cache.get('total_exited', 0)
         pending_pubkeys = self.cache.get('pending_pubkeys', [])
 
@@ -1234,6 +1250,166 @@ class NodeSetValidatorTracker:
         print(f"Stored {len(active_exiting_data)} active_exiting validators in cache")
         logging.info("Active exiting tracking completed: %d validators tracked", len(active_exiting_data))
     
+    def check_active_exiting_transitions(self):
+        """Check cached active_exiting validators to see if they've transitioned to exited status using ClickHouse"""
+        active_exiting_details = self.cache.get('active_exiting_details', {})
+        if not active_exiting_details:
+            logging.info("No active_exiting validators to check for transitions")
+            return
+        
+        print(f"Checking {len(active_exiting_details)} cached active_exiting validators for transitions...")
+        logging.info("Checking %d cached active_exiting validators for transitions", len(active_exiting_details))
+        
+        # Get validator indices from active_exiting cache
+        validator_indices = []
+        pubkey_to_index = {}
+        for pubkey, details in active_exiting_details.items():
+            validator_index = details.get('validator_index')
+            if validator_index:
+                validator_indices.append(validator_index)
+                pubkey_to_index[validator_index] = pubkey
+        
+        if not validator_indices:
+            logging.warning("No validator indices found in active_exiting cache")
+            return
+        
+        # Query ClickHouse directly for these validators to check their current status
+        indices_str = ','.join(map(str, validator_indices))
+        query = f"""
+        SELECT 
+            val_id,
+            val_status,
+            epoch,
+            val_balance,
+            val_effective_balance,
+            val_slashed
+        FROM default.validators_summary 
+        WHERE val_id IN ({indices_str})
+            AND epoch = (SELECT MAX(epoch) FROM default.validators_summary)
+        """
+        
+        try:
+            logging.info("Querying ClickHouse for cached active_exiting validators status")
+            response = requests.post(self.clickhouse_url, data=query, timeout=30)
+            
+            if response.status_code != 200:
+                logging.error("ClickHouse query failed with status %d", response.status_code)
+                return
+                
+            lines = response.text.strip().split('\n')
+            if not lines or not lines[0]:
+                print("All cached active_exiting validators are still in active_exiting state")
+                return
+            
+            # Process results and find transitions
+            exited_statuses = {}
+            still_active_exiting = 0
+            
+            for line in lines:
+                parts = line.split('\t')
+                if len(parts) >= 6:
+                    val_id = int(parts[0])
+                    status = parts[1]
+                    epoch = int(parts[2])
+                    balance = int(parts[3]) if parts[3] != '\\N' else None
+                    effective_balance = int(parts[4]) if parts[4] != '\\N' else None
+                    slashed = bool(int(parts[5])) if parts[5] != '\\N' else False
+                    
+                    if status in ['exited_unslashed', 'exited_slashed', 'withdrawal_possible', 'withdrawal_done']:
+                        # This validator has transitioned to exited state
+                        exit_info = {
+                            'status': status,
+                            'exit_epoch': epoch,
+                            'withdrawable_epoch': None,
+                            'exit_timestamp': self._epoch_to_timestamp(epoch),
+                            'withdrawable_timestamp': None,
+                            'balance': balance,
+                            'effective_balance': effective_balance,
+                            'slashed': slashed
+                        }
+                        exited_statuses[val_id] = exit_info
+                    elif status == 'active_exiting':
+                        still_active_exiting += 1
+        
+        except Exception as e:
+            logging.error("Error querying ClickHouse for active_exiting transitions: %s", str(e))
+            return
+        
+        if not exited_statuses:
+            print(f"All {len(active_exiting_details)} cached active_exiting validators are still in active_exiting state")
+            return
+        
+        # Process transitions from active_exiting to exited
+        print(f"Found {len(exited_statuses)} validators that have transitioned from active_exiting to exited")
+        
+        # Initialize exit tracking data structures
+        exited_pubkeys = set(self.cache.get('exited_pubkeys', []))
+        exit_details = self.cache.get('exit_details', {})
+        operator_exited = defaultdict(int)
+        for operator in self.cache.get('validator_pubkeys', {}):
+            operator_exited[operator] = len([pk for pk in exited_pubkeys 
+                                           if pk in self.cache.get('validator_pubkeys', {}).get(operator, [])])
+        
+        transitions_count = 0
+        
+        for validator_index, exit_info in exited_statuses.items():
+            pubkey = pubkey_to_index.get(validator_index)
+            if pubkey and pubkey in active_exiting_details:
+                # This validator has transitioned from active_exiting to exited
+                active_exiting_data = active_exiting_details[pubkey]
+                operator = active_exiting_data.get('operator')
+                
+                # Add to exited tracking
+                if pubkey not in exited_pubkeys:
+                    exited_pubkeys.add(pubkey)
+                    if operator:
+                        operator_exited[operator] += 1
+                    transitions_count += 1
+                
+                # Store detailed exit information
+                exit_details[pubkey] = {
+                    'validator_index': validator_index,
+                    'operator': operator,
+                    'operator_name': active_exiting_data.get('operator_name'),
+                    'exit_epoch': exit_info.get('exit_epoch'),
+                    'exit_timestamp': exit_info.get('exit_timestamp'),
+                    'withdrawable_epoch': exit_info.get('withdrawable_epoch'),
+                    'withdrawable_timestamp': exit_info.get('withdrawable_timestamp'),
+                    'balance': exit_info.get('balance'),
+                    'effective_balance': exit_info.get('effective_balance'),
+                    'slashed': exit_info.get('slashed', False),
+                    'status': exit_info.get('status'),
+                    'transition_from_active_exiting': True,
+                    'active_exiting_epoch': active_exiting_data.get('active_exiting_epoch'),
+                    'discovered_timestamp': int(time.time())
+                }
+                
+                # Remove from active_exiting cache
+                del active_exiting_details[pubkey]
+                
+                logging.info("Validator %d transitioned from active_exiting to %s (operator: %s)", 
+                           validator_index, exit_info.get('status'), 
+                           active_exiting_data.get('operator_name', 'unknown'))
+        
+        # Update cache with new data
+        self.cache['exited_pubkeys'] = list(exited_pubkeys)
+        self.cache['exit_details'] = exit_details
+        self.cache['active_exiting_details'] = active_exiting_details
+        self.cache['total_active_exiting'] = len(active_exiting_details)
+        
+        # Update operator exit counts
+        for operator, count in operator_exited.items():
+            if count > 0:
+                self.cache.setdefault('operator_exited', {})[operator] = count
+        
+        self._save_cache()
+        
+        if transitions_count > 0:
+            print(f"Updated {transitions_count} validators from active_exiting to exited status")
+            logging.info("Processed %d transitions from active_exiting to exited", transitions_count)
+        else:
+            print("No new transitions found")
+    
     def _epoch_to_timestamp(self, epoch: int) -> int:
         """Convert beacon chain epoch to Unix timestamp"""
         return GENESIS_TIME + (epoch * SLOTS_PER_EPOCH * SECONDS_PER_SLOT)
@@ -1242,7 +1418,7 @@ class NodeSetValidatorTracker:
         """Generate dashboard-friendly exit data with timestamps and details."""
         exit_details = self.cache.get('exit_details', {})
         operator_validators = self.cache.get('operator_validators', {})
-        operator_exited = self.cache.get('exited_validators', {})
+        operator_exited = self.cache.get('operator_exited', {})
         ens_names = self.cache.get('ens_names', {})
         ens_sources = self.cache.get('ens_sources', {})
         
@@ -1397,6 +1573,10 @@ class NodeSetValidatorTracker:
             with open(dashboard_file, 'w') as f:
                 json.dump(dashboard_data, f, indent=2)
             print(f"Dashboard data saved to {dashboard_file}")
+            
+            # Check if any cached active_exiting validators have transitioned to exited
+            print("\nChecking active_exiting validators for transitions to exited status...")
+            self.check_active_exiting_transitions()
             
             # Check ClickHouse for active_exiting validators
             print("\nChecking for active_exiting validators...")
