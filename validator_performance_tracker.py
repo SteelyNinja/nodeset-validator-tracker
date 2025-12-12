@@ -2,8 +2,14 @@
 """
 NodeSet Validator Performance Tracker
 
-Fetches performance data and activation information for all NodeSet validators 
-using beaconcha.in API and stores it in a JSON cache file for analysis.
+Fetches performance data and activation information for all NodeSet validators
+using local beacon API and ClickHouse database, storing results in a JSON cache file.
+
+Data Sources:
+- Activation data: Local beacon node API
+- Performance metrics: ClickHouse validators_summary table
+
+This eliminates 300 beaconcha.in API calls/month by using local data sources.
 """
 
 import json
@@ -29,19 +35,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class ValidatorPerformanceTracker:
-    def __init__(self, cache_file: str = "validator_performance_cache.json", batch_size: int = 100):
+    def __init__(self, cache_file: str = "validator_performance_cache.json",
+                 batch_size: int = 100,
+                 beacon_api_url: str = None,
+                 clickhouse_host: str = "192.168.202.250",
+                 clickhouse_port: int = 8123):
         self.cache_file = cache_file
         self.batch_size = batch_size
-        self.base_url = "https://beaconcha.in/api/v1"
+
+        # Local data sources (replaces beaconcha.in API)
+        self.beacon_api_url = beacon_api_url or os.getenv('BEACON_API_URL', 'http://192.168.202.2:5052')
+        self.clickhouse_url = f"http://{clickhouse_host}:{clickhouse_port}/"
+
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'NodeSet-Validator-Performance-Tracker/1.0'
+            'User-Agent': 'NodeSet-Validator-Performance-Tracker/2.0-Local'
         })
-        
+
         # Beacon chain constants for epoch to timestamp conversion
         self.GENESIS_TIMESTAMP = 1606824023  # Dec 1, 2020, 12:00:23 UTC
         self.SECONDS_PER_EPOCH = 32 * 12     # 384 seconds per epoch
-        
+
         # Load existing cache
         self.cache = self.load_cache()
     
@@ -121,7 +135,7 @@ class ValidatorPerformanceTracker:
         return data['validator_pubkeys']
     
     def get_all_validator_data(self) -> Dict[int, Dict]:
-        """Extract all validator indices and their metadata from NodeSet cache"""
+        """Extract all validator indices and their metadata from NodeSet cache, excluding exited validators"""
         cache_file = "nodeset_validator_tracker_cache.json"
         
         if not os.path.exists(cache_file):
@@ -144,18 +158,42 @@ class ValidatorPerformanceTracker:
         if 'validator_indices' not in data:
             raise ValueError("No validator_indices found in NodeSet cache")
         
+        # Get exit_details to filter out exited validators
+        exit_details = data.get('exit_details', {})
+        exited_validator_indices = set()
+        
+        # Extract validator indices from exit_details
+        for pubkey, exit_info in exit_details.items():
+            if isinstance(exit_info, dict) and 'validator_index' in exit_info:
+                exited_validator_indices.add(exit_info['validator_index'])
+        
+        logger.info(f"Found {len(exited_validator_indices)} validators in exit_details to exclude")
+        
         validator_data = {}
         validator_indices = data['validator_indices']
+        total_validators = 0
+        excluded_validators = 0
         
-        # Build mapping of validator_index -> {pubkey, operator}
+        # Build mapping of validator_index -> {pubkey, operator}, excluding exited ones
         for pubkey, validator_index in validator_indices.items():
+            total_validators += 1
+            
+            # Skip validators that appear in exit_details
+            if validator_index in exited_validator_indices:
+                excluded_validators += 1
+                logger.debug(f"Excluding exited validator {validator_index} (pubkey: {pubkey[:20]}...)")
+                continue
+            
             operator = self.get_operator_for_pubkey(pubkey)
             validator_data[validator_index] = {
                 'pubkey': pubkey,
                 'operator': operator
             }
         
-        logger.info(f"Found {len(validator_data)} validators across multiple operators")
+        logger.info(f"Total validators in cache: {total_validators}")
+        logger.info(f"Excluded exited validators: {excluded_validators}")
+        logger.info(f"Active validators for performance tracking: {len(validator_data)}")
+        
         return validator_data
     
     def get_operator_for_pubkey(self, pubkey: str) -> str:
@@ -179,57 +217,159 @@ class ValidatorPerformanceTracker:
     
     
     def fetch_validator_info_batch(self, validator_indices: List[int]) -> Optional[List[Dict]]:
-        """Fetch basic validator info including activation data for a batch of validators"""
+        """
+        Fetch basic validator info including activation data using local beacon API.
+
+        Replaces beaconcha.in API with local beacon node queries.
+        """
         if not validator_indices:
             return []
-        
-        # Join validator indices with commas for batch request
-        indices_str = ','.join(map(str, validator_indices))
-        url = f"{self.base_url}/validator/{indices_str}"
-        
-        try:
-            logger.debug(f"Fetching validator info for {len(validator_indices)} validators")
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
-            
-            data = response.json()
-            if data.get('status') == 'OK':
-                result = data.get('data', [])
-                # Debug logging to understand data format
-                if result and not isinstance(result[0], dict):
-                    logger.warning(f"Unexpected validator info data format. Expected dict, got {type(result[0])}: {result[0] if result else 'empty'}")
-                return result
-            else:
-                logger.error(f"API error for validator info: {data}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error fetching validator info batch: {e}")
-            return None
+
+        logger.debug(f"Fetching validator info from local beacon API for {len(validator_indices)} validators")
+
+        results = []
+
+        # Beacon API doesn't support batch queries, so query individually
+        # But we can parallelize if needed in the future
+        for val_index in validator_indices:
+            try:
+                url = f"{self.beacon_api_url}/eth/v1/beacon/states/head/validators/{val_index}"
+                response = self.session.get(url, timeout=10)
+
+                if response.status_code == 200:
+                    data = response.json()
+
+                    if 'data' in data:
+                        validator_data = data['data']
+                        validator_info = validator_data.get('validator', {})
+
+                        # Convert to beaconcha.in compatible format
+                        result = {
+                            'validatorindex': int(validator_data.get('index', val_index)),
+                            'activationepoch': int(validator_info.get('activation_epoch', 0)),
+                            'activationeligibilityepoch': int(validator_info.get('activation_eligibility_epoch', 0)),
+                            'exitepoch': int(validator_info.get('exit_epoch', 18446744073709551615)),
+                            'withdrawableepoch': int(validator_info.get('withdrawable_epoch', 18446744073709551615)),
+                            'status': validator_data.get('status', 'unknown'),
+                            'slashed': validator_info.get('slashed', False)
+                        }
+                        results.append(result)
+
+                elif response.status_code == 404:
+                    logger.warning(f"Validator {val_index} not found in beacon state")
+                else:
+                    logger.warning(f"Beacon API error {response.status_code} for validator {val_index}")
+
+            except Exception as e:
+                logger.error(f"Error fetching validator {val_index} from beacon API: {e}")
+                continue
+
+        logger.info(f"Successfully fetched activation data for {len(results)}/{len(validator_indices)} validators from local beacon API")
+        return results if results else None
     
     def fetch_performance_batch(self, validator_indices: List[int]) -> Optional[List[Dict]]:
-        """Fetch performance data for a batch of validators using indices"""
+        """
+        Fetch performance data for a batch of validators using ClickHouse.
+
+        Replaces beaconcha.in API with local ClickHouse queries to calculate
+        performance metrics over different time windows.
+        """
         if not validator_indices:
             return []
-        
-        # Join validator indices with commas for batch request
+
+        logger.debug(f"Fetching performance from ClickHouse for {len(validator_indices)} validators")
+
         indices_str = ','.join(map(str, validator_indices))
-        url = f"{self.base_url}/validator/{indices_str}/performance"
-        
+
+        # Query ClickHouse for performance metrics over different time windows
+        query = f"""
+        WITH current_epoch AS (
+            SELECT MAX(epoch) as max_epoch
+            FROM default.validators_summary
+        )
+        SELECT
+            val_id as validatorindex,
+
+            -- Current balance
+            MAX(val_balance) as balance,
+
+            -- Performance today (last 225 epochs ~= 1 day)
+            SUM(CASE
+                WHEN epoch >= (SELECT max_epoch - 225 FROM current_epoch)
+                THEN att_earned_reward
+                ELSE 0
+            END) as performancetoday,
+
+            -- Performance 1 day
+            SUM(CASE
+                WHEN epoch >= (SELECT max_epoch - 225 FROM current_epoch)
+                THEN att_earned_reward
+                ELSE 0
+            END) as performance1d,
+
+            -- Performance 7 days
+            SUM(CASE
+                WHEN epoch >= (SELECT max_epoch - 1575 FROM current_epoch)
+                THEN att_earned_reward
+                ELSE 0
+            END) as performance7d,
+
+            -- Performance 31 days
+            SUM(CASE
+                WHEN epoch >= (SELECT max_epoch - 6975 FROM current_epoch)
+                THEN att_earned_reward
+                ELSE 0
+            END) as performance31d,
+
+            -- Performance 365 days
+            SUM(CASE
+                WHEN epoch >= (SELECT max_epoch - 82125 FROM current_epoch)
+                THEN att_earned_reward
+                ELSE 0
+            END) as performance365d,
+
+            -- Total lifetime performance
+            SUM(att_earned_reward) as performancetotal
+
+        FROM default.validators_summary
+        WHERE val_id IN ({indices_str})
+        GROUP BY val_id
+        """
+
         try:
-            logger.debug(f"Fetching performance for {len(validator_indices)} validators (indices)")
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
-            
-            data = response.json()
-            if data.get('status') == 'OK':
-                return data.get('data', [])
-            else:
-                logger.error(f"API error: {data}")
+            response = requests.post(self.clickhouse_url, data=query, timeout=180)
+
+            if response.status_code != 200:
+                logger.error(f"ClickHouse query failed with status {response.status_code}: {response.text[:200]}")
                 return None
-                
+
+            # Parse TSV response
+            lines = response.text.strip().split('\n')
+            results = []
+
+            if lines and lines[0]:
+                for line in lines:
+                    parts = line.split('\t')
+                    if len(parts) >= 8:
+                        # Convert to beaconcha.in compatible format
+                        result = {
+                            'validatorindex': int(parts[0]),
+                            'balance': int(parts[1]) if parts[1] != '\\N' else 0,
+                            'performancetoday': int(parts[2]) if parts[2] != '\\N' else 0,
+                            'performance1d': int(parts[3]) if parts[3] != '\\N' else 0,
+                            'performance7d': int(parts[4]) if parts[4] != '\\N' else 0,
+                            'performance31d': int(parts[5]) if parts[5] != '\\N' else 0,
+                            'performance365d': int(parts[6]) if parts[6] != '\\N' else 0,
+                            'performancetotal': int(parts[7]) if parts[7] != '\\N' else 0,
+                            'rank7d': None  # Ranking is expensive to calculate, omitting for now
+                        }
+                        results.append(result)
+
+            logger.info(f"Successfully fetched performance data for {len(results)} validators from ClickHouse")
+            return results if results else None
+
         except Exception as e:
-            logger.error(f"Error fetching performance batch: {e}")
+            logger.error(f"Error fetching performance from ClickHouse: {e}")
             return None
     
     def process_combined_data(self, performance_data: List[Dict], validator_info_data: List[Dict], validator_metadata: Dict[int, Dict]):

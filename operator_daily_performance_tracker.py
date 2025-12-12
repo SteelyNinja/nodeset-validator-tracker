@@ -2,7 +2,7 @@
 """
 Operator Daily Performance Tracker
 
-Generates daily attestation performance data for NodeSet operators over the last 365 days.
+Generates daily attestation performance data for NodeSet operators over the last 1 day.
 Only processes complete UTC days and stores data in a single JSON file for dashboard consumption.
 
 Features:
@@ -21,6 +21,8 @@ import os
 import fcntl
 import tempfile
 import shutil
+import time
+import random
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
 from urllib.parse import quote
@@ -45,39 +47,79 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class ClickHouseHTTPClient:
-    """Simple HTTP client for ClickHouse queries"""
+    """Simple HTTP client for ClickHouse queries with retry logic and configurable timeouts"""
     
-    def __init__(self, host: str = "localhost", port: int = 8123, timeout: int = 30):
+    def __init__(self, host: str = "localhost", port: int = 8123, 
+                 query_timeout: int = 300, availability_timeout: int = 15,
+                 large_query_timeout: int = 120):
         self.base_url = f"http://{host}:{port}"
-        self.timeout = timeout
+        self.query_timeout = query_timeout
+        self.availability_timeout = availability_timeout  
+        self.large_query_timeout = large_query_timeout
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'NodeSet-Daily-Performance-Tracker/1.0'
         })
+        
+        # Retry configuration
+        self.retry_config = {
+            'max_retries': 3,
+            'base_delay': 2,
+            'max_delay': 30,
+            'backoff_multiplier': 2
+        }
+        
+        # Circuit breaker state
+        self.consecutive_failures = 0
+        self.max_consecutive_failures = 5
         
         # Beacon chain constants
         self.GENESIS_TIMESTAMP = 1606824023  # Dec 1, 2020, 12:00:23 UTC
         self.SECONDS_PER_EPOCH = 32 * 12     # 384 seconds per epoch
         self.EPOCHS_PER_DAY = 225            # ~225 epochs per day
     
+    def execute_query_with_retry(self, query: str, use_large_timeout: bool = False) -> List[List[str]]:
+        """Execute ClickHouse query with exponential backoff retry logic"""
+        timeout = self.large_query_timeout if use_large_timeout else self.query_timeout
+        
+        for attempt in range(self.retry_config['max_retries']):
+            try:
+                logger.debug(f"Executing query (attempt {attempt + 1}): {query[:100]}...")
+                
+                response = self.session.get(
+                    f"{self.base_url}/",
+                    params={'query': query},
+                    timeout=timeout
+                )
+                response.raise_for_status()
+                
+                # Reset consecutive failures on success
+                self.consecutive_failures = 0
+                
+                # Parse TSV response
+                return self._parse_tsv_response(response.text)
+                
+            except requests.exceptions.RequestException as e:
+                self.consecutive_failures += 1
+                
+                if attempt == self.retry_config['max_retries'] - 1:
+                    logger.error(f"Query failed after {self.retry_config['max_retries']} attempts: {e}")
+                    raise
+                
+                # Calculate delay with exponential backoff and jitter
+                delay = min(
+                    self.retry_config['base_delay'] * (self.retry_config['backoff_multiplier'] ** attempt),
+                    self.retry_config['max_delay']
+                )
+                jitter = random.uniform(0, 1)
+                total_delay = delay + jitter
+                
+                logger.warning(f"Query failed (attempt {attempt + 1}): {e}. Retrying in {total_delay:.2f}s...")
+                time.sleep(total_delay)
+    
     def execute_query(self, query: str) -> List[List[str]]:
-        """Execute ClickHouse query via HTTP interface"""
-        try:
-            logger.debug(f"Executing query: {query[:100]}...")
-            
-            response = self.session.get(
-                f"{self.base_url}/",
-                params={'query': query},
-                timeout=self.timeout
-            )
-            response.raise_for_status()
-            
-            # Parse TSV response
-            return self._parse_tsv_response(response.text)
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"ClickHouse query failed: {e}")
-            raise
+        """Execute ClickHouse query via HTTP interface (backwards compatibility wrapper)"""
+        return self.execute_query_with_retry(query)
     
     def _parse_tsv_response(self, tsv_data: str) -> List[List[str]]:
         """Parse TSV response into list of lists"""
@@ -124,11 +166,22 @@ class ClickHouseHTTPClient:
             response = self.session.get(
                 f"{self.base_url}/",
                 params={'query': 'SELECT 1'},
-                timeout=5
+                timeout=self.availability_timeout
             )
-            return response.status_code == 200
-        except Exception:
+            if response.status_code == 200:
+                self.consecutive_failures = 0
+                return True
             return False
+        except Exception:
+            self.consecutive_failures += 1
+            return False
+    
+    def check_connection_health(self) -> bool:
+        """Check connection health and implement circuit breaker"""
+        if self.consecutive_failures >= self.max_consecutive_failures:
+            logger.error(f"Circuit breaker activated: {self.consecutive_failures} consecutive failures")
+            return False
+        return self.is_available()
 
 class OperatorDailyPerformanceTracker:
     """Tracks daily attestation performance for NodeSet operators"""
@@ -140,7 +193,13 @@ class OperatorDailyPerformanceTracker:
                  max_days: int = 365):
         self.cache_file = cache_file
         self.max_days = max_days
-        self.clickhouse = ClickHouseHTTPClient(clickhouse_host, clickhouse_port)
+        self.clickhouse = ClickHouseHTTPClient(
+            host=clickhouse_host, 
+            port=clickhouse_port,
+            query_timeout=300,
+            availability_timeout=15,
+            large_query_timeout=120
+        )
         
         # Load existing cache
         self.cache = self.load_cache()
@@ -196,7 +255,7 @@ class OperatorDailyPerformanceTracker:
         try:
             # Get the epoch range available in database
             query = "SELECT MIN(epoch), MAX(epoch) FROM validators_summary WHERE val_nos_name IS NOT NULL"
-            raw_data = self.clickhouse.execute_query(query)
+            raw_data = self.clickhouse.execute_query_with_retry(query)
             
             if not raw_data or len(raw_data[0]) < 2:
                 logger.error("Could not get epoch range from database")
@@ -247,7 +306,7 @@ class OperatorDailyPerformanceTracker:
         """Get list of NodeSet operators from database"""
         try:
             query = "SELECT DISTINCT val_nos_name FROM validators_summary WHERE val_nos_name IS NOT NULL ORDER BY val_nos_name"
-            raw_data = self.clickhouse.execute_query(query)
+            raw_data = self.clickhouse.execute_query_with_retry(query)
             
             operators = [row[0] for row in raw_data if row[0]]
             logger.info(f"Found {len(operators)} NodeSet operators")
@@ -312,14 +371,17 @@ class OperatorDailyPerformanceTracker:
                 SUM(CASE WHEN is_active_duty = 1 THEN COALESCE(att_earned_reward, 0) ELSE 0 END) as total_earned_rewards,
                 SUM(CASE WHEN is_active_duty = 1 THEN COALESCE(att_penalty, 0) ELSE 0 END) as total_penalties,
                 
-                -- Calculate average reward per successful attestation for theoretical calculation
+                -- Missed rewards for theoretical maximum calculation (API-compatible)
+                SUM(CASE WHEN is_active_duty = 1 THEN COALESCE(att_missed_reward, 0) ELSE 0 END) as total_missed_rewards,
+                
+                -- Calculate average reward per successful attestation for fallback calculation
                 AVG(CASE WHEN successful_attestation = 1 AND att_earned_reward IS NOT NULL THEN att_earned_reward END) as avg_reward_per_attestation
                 
             FROM daily_data
             GROUP BY val_nos_name
             """
             
-            raw_data = self.clickhouse.execute_query(query)
+            raw_data = self.clickhouse.execute_query_with_retry(query, use_large_timeout=True)
             
             if not raw_data or len(raw_data) == 0:
                 # No data for this operator on this day
@@ -345,7 +407,8 @@ class OperatorDailyPerformanceTracker:
             avg_inclusion_delay = safe_float(row[9])
             total_earned_rewards = safe_int(row[10])
             total_penalties = safe_int(row[11])
-            avg_reward_per_attestation = safe_float(row[12])
+            total_missed_rewards = safe_int(row[12])
+            avg_reward_per_attestation = safe_float(row[13])
             
             # Calculate performance metrics
             participation_rate = (successful_attestations / active_duty_periods * 100) if active_duty_periods > 0 else 0.0
@@ -355,10 +418,18 @@ class OperatorDailyPerformanceTracker:
             target_accuracy = (target_correct / total_attestations_made * 100) if total_attestations_made > 0 else 0.0
             source_accuracy = (source_correct / total_attestations_made * 100) if total_attestations_made > 0 else 0.0
             
-            # Performance vs theoretical (net rewards vs max possible)
+            # Performance vs theoretical maximum (API-compatible calculation)
             net_rewards = total_earned_rewards - total_penalties
-            max_possible_rewards = active_duty_periods * avg_reward_per_attestation
-            attestation_performance = (net_rewards / max_possible_rewards * 100) if max_possible_rewards > 0 else 0.0
+            
+            # Use API methodology: earned_rewards / (earned_rewards + missed_rewards)
+            theoretical_max_rewards = total_earned_rewards + total_missed_rewards
+            
+            # Fallback to old method if no missed rewards data available
+            if theoretical_max_rewards == 0 and avg_reward_per_attestation > 0:
+                theoretical_max_rewards = active_duty_periods * avg_reward_per_attestation
+                logger.debug(f"Using fallback theoretical calculation for {operator} on {date.date()}")
+            
+            attestation_performance = (total_earned_rewards / theoretical_max_rewards * 100) if theoretical_max_rewards > 0 else 0.0
             
             return {
                 "date": date.strftime("%Y-%m-%d"),
@@ -376,7 +447,7 @@ class OperatorDailyPerformanceTracker:
                 "total_earned_rewards": total_earned_rewards,
                 "total_penalties": total_penalties,
                 "net_rewards": net_rewards,
-                "max_possible_rewards": int(max_possible_rewards)
+                "max_possible_rewards": theoretical_max_rewards
             }
             
         except Exception as e:
@@ -393,12 +464,38 @@ class OperatorDailyPerformanceTracker:
         operator_data = self.cache["operators"][operator]
         existing_dates = {day["date"] for day in operator_data["daily_performance"]}
         
+        # Get today's date in UTC for comparison
+        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        
+        # Find the most recent stored date to check if it needs updating
+        most_recent_stored_date = None
+        if operator_data["daily_performance"]:
+            # Sort to get the most recent date
+            sorted_dates = sorted([day["date"] for day in operator_data["daily_performance"]], reverse=True)
+            most_recent_stored_date = sorted_dates[0]
+        
         new_days_added = 0
         for date in days_to_process:
             date_str = date.strftime("%Y-%m-%d")
             
-            if date_str not in existing_dates:
+            # Always update today's data as more becomes available throughout the day
+            # Also update the most recent stored day (in case script didn't run for several days)
+            # For other past days, only process if not already cached
+            should_process = (date_str not in existing_dates or 
+                            date_str == today_utc or 
+                            date_str == most_recent_stored_date)
+            
+            if should_process:
                 daily_perf = self.calculate_daily_performance(operator, date)
+                
+                # If updating today's data or most recent stored data, remove existing entry first
+                if ((date_str == today_utc or date_str == most_recent_stored_date) and 
+                    date_str in existing_dates):
+                    operator_data["daily_performance"] = [
+                        day for day in operator_data["daily_performance"] 
+                        if day["date"] != date_str
+                    ]
+                
                 if daily_perf:
                     operator_data["daily_performance"].append(daily_perf)
                     new_days_added += 1
@@ -441,8 +538,8 @@ class OperatorDailyPerformanceTracker:
         """Main function to update daily performance data"""
         logger.info("Starting operator daily performance update")
         
-        if not self.clickhouse.is_available():
-            logger.error("ClickHouse is not available")
+        if not self.clickhouse.check_connection_health():
+            logger.error("ClickHouse is not available or circuit breaker is active")
             return
         
         # Get available complete days

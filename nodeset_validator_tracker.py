@@ -898,107 +898,157 @@ class NodeSetValidatorTracker:
         return dict(operator_exited), total_exited
 
     def check_performance(self):
-        """Check validator attestation performance and store in cache."""
-        # Check if performance was updated recently (1 hour = 3600 seconds)
+        """
+        Check validator attestation performance using ClickHouse database.
+
+        This replaces the previous beaconcha.in API implementation to eliminate
+        7,200 API calls/month and use local data instead.
+        """
+        # Check if performance was updated recently (6 hours = 21600 seconds)
         last_performance_update = self.cache.get('performance_last_updated', 0)
         current_time = int(time.time())
-        
-        if current_time - last_performance_update < 3600:  # 1 hour
+
+        if current_time - last_performance_update < 21600:  # 6 hours
             hours_since_update = (current_time - last_performance_update) // 3600
             logging.info("Performance data updated recently (%d hours ago), skipping", hours_since_update)
-            print(f"Performance data updated {hours_since_update} hours ago, skipping API calls")
+            print(f"Performance data updated {hours_since_update} hours ago, skipping ClickHouse query")
             # Return existing performance data from cache
             return list(self.cache.get('operator_performance', {}).items())
-        
-        print("Performance data is stale (>1 hour), fetching fresh data from beaconcha.in...")
-        logging.info("Starting performance check - last update was %d hours ago", 
+
+        print("Performance data is stale (>6 hours), fetching from ClickHouse...")
+        logging.info("Starting performance check from ClickHouse - last update was %d hours ago",
                     (current_time - last_performance_update) // 3600)
-        
-        beaconchain_conn = http.client.HTTPSConnection("beaconcha.in")
+
+        # Get validator indices we're tracking
         validator_indices = dict(self.cache.get('validator_indices', {}))
         exited_pubkeys = set(self.cache.get('exited_pubkeys', []))
 
-        pubkeys = [pk for pk in validator_indices.keys() if pk not in exited_pubkeys]
+        # Get list of active validator indices
+        active_validator_indices = []
+        pubkey_to_index = {}
+        for pubkey, val_index in validator_indices.items():
+            if pubkey not in exited_pubkeys:
+                active_validator_indices.append(val_index)
+                pubkey_to_index[val_index] = pubkey
 
-        batch_size = 100
-        performance_results = {}
-        api_call_count = 0
+        if not active_validator_indices:
+            logging.warning("No active validators to check performance for")
+            return []
 
-        for i in range(0, len(pubkeys), batch_size):
-            print(f"Fetching range {i} to {i + batch_size}...")
-            batch = pubkeys[i:i + batch_size]
+        # Build ClickHouse query
+        # We'll look at the last 225 epochs (~1 day) to calculate recent performance
+        indices_str = ','.join(map(str, active_validator_indices))
 
-            while True:
-                try:
-                    endpoint = f"/api/v1/validator/{','.join(map(str, batch))}/attestationefficiency"
-                    beaconchain_conn.request("GET", endpoint)
-                    res = beaconchain_conn.getresponse()
+        query = f"""
+        WITH recent_epochs AS (
+            SELECT MAX(epoch) as max_epoch
+            FROM default.validators_summary
+        ),
+        performance_data AS (
+            SELECT
+                val_id,
+                -- Count duties (epochs where validator was active)
+                SUM(CASE WHEN val_status = 'active_ongoing' THEN 1 ELSE 0 END) as total_duties,
+                -- Count successful attestations
+                SUM(CASE WHEN val_status = 'active_ongoing' AND att_happened = 1 THEN 1 ELSE 0 END) as successful_attestations,
+                -- Count correct head votes (for efficiency calculation)
+                SUM(CASE WHEN val_status = 'active_ongoing' AND att_happened = 1 AND att_valid_head = 1 THEN 1 ELSE 0 END) as head_correct,
+                -- Count correct target votes
+                SUM(CASE WHEN val_status = 'active_ongoing' AND att_happened = 1 AND att_valid_target = 1 THEN 1 ELSE 0 END) as target_correct,
+                -- Count correct source votes
+                SUM(CASE WHEN val_status = 'active_ongoing' AND att_happened = 1 AND att_valid_source = 1 THEN 1 ELSE 0 END) as source_correct
+            FROM default.validators_summary
+            WHERE val_id IN ({indices_str})
+                AND epoch >= (SELECT max_epoch - 225 FROM recent_epochs)
+                AND epoch <= (SELECT max_epoch FROM recent_epochs)
+            GROUP BY val_id
+        )
+        SELECT
+            val_id,
+            total_duties,
+            successful_attestations,
+            head_correct,
+            target_correct,
+            source_correct,
+            -- Calculate attestation efficiency (similar to beaconcha.in)
+            -- Efficiency = successful_attestations / total_duties * 100
+            CASE
+                WHEN total_duties > 0
+                THEN (successful_attestations * 100.0 / total_duties)
+                ELSE 0
+            END as attestation_rate
+        FROM performance_data
+        WHERE total_duties > 0
+        """
 
-                    if res.status == 429:
-                        print(f"Rate limit hit after {api_call_count} calls. Backing off for 60 seconds...")
-                        logging.warning("Rate limit encountered, backing off for 60 seconds")
-                        res.read()
-                        res.close()
-                        time.sleep(60)
-                        api_call_count = 0
-                        continue
+        try:
+            logging.info("Querying ClickHouse for validator performance")
+            response = requests.post(self.clickhouse_url, data=query, timeout=180)
 
-                    if res.status != 200:
-                        print(f"HTTP error {res.status} for batch {i} to {i + batch_size}")
-                        res.read()
-                        res.close()
-                        break
+            if response.status_code != 200:
+                logging.error("ClickHouse query failed with status %d: %s",
+                            response.status_code, response.text[:200])
+                # Return cached data if available
+                return list(self.cache.get('operator_performance', {}).items())
 
-                    data = res.read().decode("utf-8")
-                    res.close()
-                    api_call_count += 1
+            # Parse results
+            performance_by_validator = {}
+            lines = response.text.strip().split('\n')
 
-                    try:
-                        parsed = json.loads(data)
-                    except json.JSONDecodeError as e:
-                        print(f"Failed to parse JSON for batch {i} to {i + batch_size}: {e}")
-                        break
+            if lines and lines[0]:
+                for line in lines:
+                    parts = line.split('\t')
+                    if len(parts) >= 7:
+                        val_id = int(parts[0])
+                        total_duties = int(parts[1])
+                        successful = int(parts[2])
+                        head_correct = int(parts[3])
+                        target_correct = int(parts[4])
+                        source_correct = int(parts[5])
+                        attestation_rate = float(parts[6])
 
-                    status = parsed.get("status")
-                    if status == "OK":
-                        for entry in parsed.get("data", []):
-                            index = entry.get("validatorindex")
-                            efficiency = entry.get("attestation_efficiency")
-                            percent = max(0, round((2 - efficiency) * 100, 2))
-                            performance_results[index] = percent
-                    else:
-                        print(f"Batch failed for range {i} to {i + batch_size}")
+                        # Store performance as percentage (same format as beaconcha.in)
+                        performance_by_validator[val_id] = attestation_rate
 
-                    break
+                        logging.debug("Validator %d: %.2f%% attestation rate (%d/%d successful)",
+                                    val_id, attestation_rate, successful, total_duties)
 
-                except Exception as e:
-                    print(f"Error fetching performance for batch from {i} to {i + batch_size}: {e}")
-                    break
+            logging.info("Retrieved performance for %d validators from ClickHouse",
+                        len(performance_by_validator))
 
-        beaconchain_conn.close()
+            # Aggregate by operator (same logic as original)
+            results = []
+            operator_pubkeys = dict(self.cache.get('validator_pubkeys', {}))
 
-        results = []
-        operator_pubkeys = defaultdict(list, self.cache.get('validator_pubkeys', {}))
-        for operator in operator_pubkeys:
-            total = 0
-            count = 0
-            for pubkey in operator_pubkeys[operator]:
-                index = self._get_validator_index(pubkey)
-                performance = performance_results.get(index, None)
-                if performance is not None:
-                    total += performance
-                    count += 1
+            for operator, pubkeys in operator_pubkeys.items():
+                total_performance = 0
+                count = 0
 
-            if count > 0:
-                results.append((operator, total / count))
+                for pubkey in pubkeys:
+                    val_index = validator_indices.get(pubkey)
+                    if val_index and val_index in performance_by_validator:
+                        total_performance += performance_by_validator[val_index]
+                        count += 1
 
-        self.cache['operator_performance'] = dict(results)
-        self.cache['performance_last_updated'] = current_time
-        
-        print(f"Performance data updated successfully for {len(results)} operators")
-        logging.info("Performance check completed: %d operators updated", len(results))
+                if count > 0:
+                    avg_performance = total_performance / count
+                    results.append((operator, avg_performance))
+                    logging.debug("Operator %s: %.2f%% avg performance across %d validators",
+                                operator[:10], avg_performance, count)
 
-        return results
+            # Update cache
+            self.cache['operator_performance'] = dict(results)
+            self.cache['performance_last_updated'] = current_time
+
+            print(f"Performance data updated successfully for {len(results)} operators (from ClickHouse)")
+            logging.info("Performance check completed: %d operators updated from ClickHouse", len(results))
+
+            return results
+
+        except Exception as e:
+            logging.error("Error querying ClickHouse for performance: %s", str(e))
+            # Return cached data if available
+            return list(self.cache.get('operator_performance', {}).items())
 
     def generate_report(self, operator_validators: dict, operator_exited: dict,
                        total_validators: int, total_exited: int, operator_performance: dict) -> None:
