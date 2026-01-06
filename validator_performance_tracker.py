@@ -401,19 +401,19 @@ class ValidatorPerformanceTracker:
                 activation_eligibility_epoch = info.get('activationeligibilityepoch')
                 exit_epoch = info.get('exitepoch')
                 
-                if activation_epoch and activation_epoch != 9223372036854775807:  # Max uint64 means not set
+                if activation_epoch and activation_epoch != 18446744073709551615:  # Max uint64 means not set
                     activation_data = {
                         "activation_epoch": activation_epoch,
                         "activation_timestamp": self.epoch_to_timestamp(activation_epoch),
                         "activation_date": self.epoch_to_datetime(activation_epoch).isoformat(),
                     }
-                
-                if activation_eligibility_epoch:
+
+                if activation_eligibility_epoch and activation_eligibility_epoch != 18446744073709551615:
                     activation_data["activation_eligibility_epoch"] = activation_eligibility_epoch
                     activation_data["activation_eligibility_timestamp"] = self.epoch_to_timestamp(activation_eligibility_epoch)
                     activation_data["activation_eligibility_date"] = self.epoch_to_datetime(activation_eligibility_epoch).isoformat()
-                
-                if exit_epoch and exit_epoch != 9223372036854775807:  # Check if actually exited
+
+                if exit_epoch and exit_epoch != 18446744073709551615:  # Check if actually exited
                     activation_data["exit_epoch"] = exit_epoch
                     activation_data["exit_timestamp"] = self.epoch_to_timestamp(exit_epoch)
                     activation_data["exit_date"] = self.epoch_to_datetime(exit_epoch).isoformat()
