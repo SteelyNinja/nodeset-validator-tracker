@@ -44,29 +44,9 @@ WORKING_MEV_RELAYS = {
         'rate_limit': 0.1,
         'active': True
     },
-    'bloxroute_max_profit': {
-        'name': 'bloXroute Max Profit',
-        'endpoint': 'https://bloxroute.max-profit.blxrbdn.com/relay/v1/data/validator_registration',
-        'headers': {
-            'Accept': 'application/json',
-            'User-Agent': 'MEV-Analyzer/1.0'
-        },
-        'rate_limit': 0.05,
-        'active': True
-    },
     'bloxroute_regulated': {
         'name': 'bloXroute Regulated',
         'endpoint': 'https://bloxroute.regulated.blxrbdn.com/relay/v1/data/validator_registration',
-        'headers': {
-            'Accept': 'application/json',
-            'User-Agent': 'MEV-Analyzer/1.0'
-        },
-        'rate_limit': 0.05,
-        'active': True
-    },
-    'bloxroute_ethical': {
-        'name': 'bloXroute Ethical',
-        'endpoint': 'https://bloxroute.ethical.blxrbdn.com/relay/v1/data/validator_registration',
         'headers': {
             'Accept': 'application/json',
             'User-Agent': 'MEV-Analyzer/1.0'
@@ -84,9 +64,9 @@ WORKING_MEV_RELAYS = {
         'rate_limit': 0.1,
         'active': True
     },
-    'aestus': {
-        'name': 'Aestus',
-        'endpoint': 'https://aestus.live/relay/v1/data/validator_registration',
+    'titan': {
+        'name': 'Titan',
+        'endpoint': 'https://titanrelay.xyz/relay/v1/data/validator_registration',
         'headers': {
             'Accept': 'application/json',
             'User-Agent': 'MEV-Analyzer/1.0'
@@ -94,9 +74,9 @@ WORKING_MEV_RELAYS = {
         'rate_limit': 0.1,
         'active': True
     },
-    'securerpc': {
-        'name': 'SecureRPC',
-        'endpoint': 'https://mainnet-relay.securerpc.com/relay/v1/data/validator_registration',
+    'aestus': {
+        'name': 'Aestus',
+        'endpoint': 'https://aestus.live/relay/v1/data/validator_registration',
         'headers': {
             'Accept': 'application/json',
             'User-Agent': 'MEV-Analyzer/1.0'
@@ -186,8 +166,8 @@ class StandaloneMEVAnalyzer:
                     timeout=15
                 )
                 
-                # 200 = found, 404 = not found (both mean API is working)
-                is_working = response.status_code in [200, 404]
+                # 200 = found, 400/404 = not found (relays differ; all mean API is working)
+                is_working = response.status_code in [200, 400, 404]
                 
                 if is_working:
                     working_relays[relay_name] = relay_config
@@ -196,7 +176,7 @@ class StandaloneMEVAnalyzer:
                     if response.status_code == 200:
                         print(f"   📝 {relay_config['name']}: HTTP 200 (found test validator)")
                     else:
-                        print(f"   ✅ {relay_config['name']}: HTTP 404 (API working)")
+                        print(f"   ✅ {relay_config['name']}: HTTP {response.status_code} (API working)")
                 else:
                     self.failed_relays[relay_name] = f"HTTP {response.status_code}"
                     print(f"   ❌ {relay_config['name']}: HTTP {response.status_code}")
