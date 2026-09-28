@@ -2,7 +2,7 @@
 NodeSet Block Proposal Tracker with Missed Proposal Detection
 
 Tracks both successful and missed block proposals for NodeSet validators.
-Uses local Lighthouse + beaconcha.in API for comprehensive reward analysis.
+Uses local Lighthouse + execution client + MEV relay data APIs for reward analysis.
 
 Enhanced with:
 - Delayed missed proposal checking to avoid false positives
@@ -17,6 +17,7 @@ import requests
 import re
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple, Set, Optional
 from web3 import Web3
 import datetime
@@ -53,7 +54,20 @@ PROPOSAL_CACHE_FILE = "proposal_cache.json"
 PROPOSAL_DATA_FILE = "proposals.json"
 MISSED_PROPOSALS_CACHE_FILE = "missed_proposals_cache.json"
 
-BEACONCHAIN_API_BASE = "https://beaconcha.in/api/v1"
+# Relay tags match those previously returned by beaconcha.in so historical data stays consistent
+MEV_RELAYS = {
+    'flashbots-relay': 'https://boost-relay.flashbots.net',
+    'ultrasound-relay': 'https://relay.ultrasound.money',
+    'titan-relay': 'https://titanrelay.xyz',
+    'bloxroute-regulated-relay': 'https://bloxroute.regulated.blxrbdn.com',
+    'aestus-relay': 'https://aestus.live',
+    'agnostic-relay': 'https://agnostic-relay.net',
+}
+RELAY_PAYLOAD_PATH = "/relay/v1/data/bidtraces/proposer_payload_delivered"
+
+# Execution data sources that are considered final; anything else is retried by the backfill
+FINAL_EXECUTION_SOURCES = {'beaconchain_api', 'mev_relay_api', 'execution_receipts', 'builder_payment_tx'}
+AUTO_RETRY_DAYS = 7
 
 @dataclass
 class RewardComponents:
@@ -205,10 +219,7 @@ class EnhancedProposalTracker:
         self.tracked_validators = self._get_tracked_validators()
         self.missed_proposals_cache = self._load_missed_proposals_cache()
         self.proposer_duties_cache = {}
-        
-        self.last_beaconchain_call = 0
-        self.beaconchain_rate_limit = 0.1
-        
+
         # Configuration for improved missed proposal detection
         self.MIN_SLOT_AGE_FOR_MISSED_CHECK = 64  # Wait 64 slots (~12.8 minutes) before checking
         self.MISSED_PROPOSAL_RECHECK_HOURS = 24  # Re-check proposals from last 24 hours
@@ -234,15 +245,6 @@ class EnhancedProposalTracker:
                 raise ConnectionError(f"Beacon API health check failed: {response.status_code}")
         except Exception as e:
             raise ConnectionError(f"Failed to connect to beacon API: {str(e)}")
-
-    def _rate_limit_wait(self, api_type: str) -> None:
-        current_time = time.time()
-        
-        if api_type == "beaconchain":
-            time_since_last = current_time - self.last_beaconchain_call
-            if time_since_last < self.beaconchain_rate_limit:
-                time.sleep(self.beaconchain_rate_limit - time_since_last)
-            self.last_beaconchain_call = time.time()
 
     def _load_cache(self) -> dict:
         if os.path.exists(PROPOSAL_CACHE_FILE):
@@ -696,161 +698,158 @@ class EnhancedProposalTracker:
             }
             return estimated_consensus_gwei * 1e9, details
 
-    def _get_execution_rewards_beaconchain(self, slot: int, block_number: int) -> Tuple[int, int, dict]:
-        if not self.enable_external_apis:
-            return 0, 0, {}
-            
-        try:
-            self._rate_limit_wait("beaconchain")
-            
-            response = requests.get(
-                f"{BEACONCHAIN_API_BASE}/execution/block/{block_number}",
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if data.get('status') == 'OK' and data.get('data') and len(data['data']) > 0:
-                    block_data = data['data'][0]
-                    
-                    if block_data is None:
-                        return 0, 0, {'data_source': 'beaconchain_null_data'}
-                    
-                    block_reward_wei = int(block_data.get('blockReward', 0))
-                    mev_reward_wei = int(block_data.get('blockMevReward', 0))
-                    producer_reward_wei = int(block_data.get('producerReward', 0))
-                    
-                    relay_info = block_data.get('relay', {}) or {}
-                    is_mev_boost = bool(relay_info.get('tag'))
-                    
-                    total_execution_reward = producer_reward_wei
-                    mev_breakdown = mev_reward_wei if is_mev_boost else 0
-                    traditional_fees = max(0, total_execution_reward - mev_breakdown)
-                    
-                    gas_used = block_data.get('gasUsed', 0)
-                    gas_limit = block_data.get('gasLimit', 0)
-                    base_fee = block_data.get('baseFee', 0)
-                    tx_count = block_data.get('txCount', 0)
-                    fee_recipient = block_data.get('feeRecipient', '')
-                    
-                    details = {
-                        'block_reward_wei': block_reward_wei,
-                        'producer_reward_wei': producer_reward_wei,
-                        'execution_reward_wei': total_execution_reward,
-                        'mev_breakdown_wei': mev_breakdown,
-                        'traditional_fees_wei': traditional_fees,
-                        'gas_used': gas_used,
-                        'gas_limit': gas_limit,
-                        'gas_utilization': (gas_used / gas_limit * 100) if gas_limit > 0 else 0,
-                        'base_fee_per_gas': base_fee,
-                        'transaction_count': tx_count,
-                        'fee_recipient': fee_recipient,
-                        'is_mev_boost_block': is_mev_boost,
-                        'relay_tag': relay_info.get('tag', '') if is_mev_boost else '',
-                        'builder_pubkey': relay_info.get('builderPubkey', '') if is_mev_boost else '',
-                        'data_source': 'beaconchain_api'
-                    }
-                    
-                    return total_execution_reward, mev_breakdown, details
-                    
-                else:
-                    return 0, 0, {'data_source': 'beaconchain_no_data'}
-                    
-            elif response.status_code == 404:
-                return 0, 0, {'data_source': 'beaconchain_not_found'}
-            else:
-                return 0, 0, {'data_source': 'beaconchain_error', 'status_code': response.status_code}
-                
-        except requests.exceptions.Timeout:
-            return 0, 0, {'data_source': 'beaconchain_timeout'}
-        except Exception as e:
-            return 0, 0, {'data_source': 'beaconchain_error', 'error': str(e)[:100]}
+    def _query_relay(self, relay_tag: str, relay_url: str, slot: int) -> Tuple[str, Optional[list]]:
+        url = f"{relay_url}{RELAY_PAYLOAD_PATH}?slot={slot}"
+        for attempt in range(2):
+            try:
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    return relay_tag, response.json()
+                logging.warning("Relay %s returned HTTP %d for slot %d", relay_tag, response.status_code, slot)
+            except Exception as e:
+                logging.warning("Relay %s request failed for slot %d: %s", relay_tag, slot, str(e)[:100])
+            if attempt == 0:
+                time.sleep(1)
+        return relay_tag, None
 
-    def _get_execution_rewards_local(self, execution_payload: dict) -> Tuple[int, dict]:
+    def _get_relay_delivery(self, slot: int, block_hash: str) -> Tuple[Optional[dict], List[str]]:
+        """
+        Query all known relays for the payload delivered at this slot.
+        Returns (payload matching block_hash with 'relay_tag' added, relays that failed to respond).
+        """
+        with ThreadPoolExecutor(max_workers=len(MEV_RELAYS)) as pool:
+            results = list(pool.map(lambda relay: self._query_relay(relay[0], relay[1], slot), MEV_RELAYS.items()))
+
+        match = None
+        failed_relays = []
+        for relay_tag, payloads in results:
+            if payloads is None:
+                failed_relays.append(relay_tag)
+                continue
+            for payload in payloads:
+                if match is None and payload.get('block_hash', '').lower() == block_hash.lower():
+                    match = {**payload, 'relay_tag': relay_tag}
+
+        return match, failed_relays
+
+    def _get_priority_fees(self, block_number: int, base_fee: int) -> int:
+        response = self.web3.provider.make_request('eth_getBlockReceipts', [hex(block_number)])
+        receipts = response.get('result')
+        if receipts is None:
+            raise ValueError(f"eth_getBlockReceipts failed for block {block_number}: {response.get('error')}")
+
+        return sum(
+            (int(r['effectiveGasPrice'], 16) - base_fee) * int(r['gasUsed'], 16)
+            for r in receipts
+        )
+
+    def _get_builder_payment(self, block) -> Optional[int]:
+        """Builders pay the proposer with a final transaction sent from the block's fee recipient"""
+        if not block['transactions']:
+            return None
+
+        last_tx = self.web3.eth.get_transaction(block['transactions'][-1])
+        if (last_tx['from'] == block['miner'] and last_tx.get('to')
+                and last_tx['to'] != block['miner'] and last_tx['value'] > 0):
+            return last_tx['value']
+        return None
+
+    def _get_execution_rewards(self, slot: int, block_number: int) -> Tuple[int, int, dict]:
+        """
+        Returns (execution reward paid to the proposer, MEV portion, details).
+        MEV-Boost blocks are identified from relay data APIs; for those the proposer
+        reward is the relay-reported value. Locally built blocks earn the priority fees.
+        """
         try:
-            base_fee_per_gas = int(execution_payload.get('base_fee_per_gas', '0'))
-            gas_used = int(execution_payload.get('gas_used', '0'))
-            gas_limit = int(execution_payload.get('gas_limit', '0'))
-            transactions = execution_payload.get('transactions', [])
-            
-            total_priority_fees = 0
-            
-            block_number = int(execution_payload.get('block_number', '0'))
-            current_block = self.web3.eth.block_number
-            
-            if current_block - block_number < 100:
-                try:
-                    execution_block = self.web3.eth.get_block(block_number, full_transactions=True)
-                    
-                    for tx in execution_block.transactions:
-                        if hasattr(tx, 'maxPriorityFeePerGas') and hasattr(tx, 'maxFeePerGas'):
-                            priority_fee = min(
-                                tx.maxPriorityFeePerGas,
-                                tx.maxFeePerGas - base_fee_per_gas
-                            )
-                            if priority_fee > 0:
-                                receipt = self.web3.eth.get_transaction_receipt(tx.hash)
-                                total_priority_fees += priority_fee * receipt.gasUsed
-                                
-                except Exception as e:
-                    logging.debug("Error getting execution block details: %s", str(e))
-            
-            if total_priority_fees == 0 and gas_used > 0:
-                avg_priority_fee = 2 * 1e9
-                total_priority_fees = avg_priority_fee * gas_used
-            
+            block = self.web3.eth.get_block(block_number)
+            block_hash = Web3.to_hex(block['hash'])
+            base_fee = block.get('baseFeePerGas', 0)
+            gas_used = block['gasUsed']
+            gas_limit = block['gasLimit']
+
+            priority_fees = self._get_priority_fees(block_number, base_fee)
+
             details = {
-                'base_fee_per_gas': base_fee_per_gas,
+                'block_reward_wei': priority_fees,
                 'gas_used': gas_used,
                 'gas_limit': gas_limit,
                 'gas_utilization': (gas_used / gas_limit * 100) if gas_limit > 0 else 0,
-                'transaction_count': len(transactions),
-                'priority_fees_wei': total_priority_fees,
-                'data_source': 'local_execution_analysis'
+                'base_fee_per_gas': base_fee,
+                'transaction_count': len(block['transactions']),
+                'fee_recipient': block['miner'],
+                'is_mev_boost_block': False,
+                'relay_tag': '',
+                'builder_pubkey': '',
             }
-            
-            return total_priority_fees, details
-            
-        except Exception as e:
-            logging.debug("Error calculating local execution rewards: %s", str(e))
-            return 0, {}
 
-    def _detect_mev_heuristic(self, execution_payload: dict) -> Tuple[int, dict]:
-        try:
-            gas_used = int(execution_payload.get('gas_used', '0'))
-            gas_limit = int(execution_payload.get('gas_limit', '0'))
-            transaction_count = len(execution_payload.get('transactions', []))
-            
-            mev_score = 0
-            estimated_mev = 0
-            
-            if gas_used > (gas_limit * 0.95):
-                mev_score += 3
-                estimated_mev += 0.02 * 1e18
-                
-            if transaction_count > 200:
-                mev_score += 2
-                estimated_mev += 0.01 * 1e18
-                
-            if gas_used > 25000000:
-                mev_score += 2
-                estimated_mev += 0.015 * 1e18
-                
-            details = {
-                'mev_score': mev_score,
-                'estimated_mev_wei': estimated_mev,
-                'gas_used': gas_used,
-                'gas_utilization': (gas_used / gas_limit * 100) if gas_limit > 0 else 0,
-                'transaction_count': transaction_count,
-                'data_source': 'heuristic_analysis'
-            }
-            
-            return int(estimated_mev), details
-            
+            if self.enable_external_apis:
+                relay_payload, failed_relays = self._get_relay_delivery(slot, block_hash)
+            else:
+                relay_payload, failed_relays = None, list(MEV_RELAYS)
+
+            if relay_payload:
+                mev_wei = int(relay_payload['value'])
+                details.update({
+                    'is_mev_boost_block': True,
+                    'relay_tag': relay_payload['relay_tag'],
+                    'builder_pubkey': relay_payload.get('builder_pubkey', ''),
+                    'data_source': 'mev_relay_api'
+                })
+            else:
+                builder_payment = self._get_builder_payment(block)
+                if builder_payment is not None:
+                    # Builder block delivered by a relay we don't query (or one that failed to respond)
+                    mev_wei = builder_payment
+                    details.update({
+                        'is_mev_boost_block': True,
+                        'relay_tag': 'unknown-relay',
+                        'data_source': 'relay_lookup_incomplete' if failed_relays else 'builder_payment_tx'
+                    })
+                else:
+                    mev_wei = 0
+                    details['data_source'] = 'relay_lookup_incomplete' if failed_relays else 'execution_receipts'
+
+            if failed_relays:
+                details['failed_relays'] = failed_relays
+                logging.warning("Slot %d: relays failed to respond: %s", slot, ', '.join(failed_relays))
+
+            execution_wei = mev_wei if details['is_mev_boost_block'] else priority_fees
+            details.update({
+                'producer_reward_wei': execution_wei,
+                'execution_reward_wei': execution_wei,
+                'mev_breakdown_wei': mev_wei,
+                'traditional_fees_wei': execution_wei - mev_wei,
+            })
+
+            return execution_wei, mev_wei, details
+
         except Exception as e:
-            logging.debug("Error in MEV heuristic detection: %s", str(e))
-            return 0, {}
+            logging.warning("Error getting execution rewards for slot %d (block %d): %s", slot, block_number, str(e))
+            return 0, 0, {'data_source': 'execution_lookup_failed', 'error': str(e)[:100]}
+
+    def _execution_fields(self, execution_wei: int, mev_breakdown_wei: int, details: dict) -> dict:
+        return {
+            'execution_fees_eth': round(execution_wei / 1e18, 10),
+            'mev_breakdown_eth': round(mev_breakdown_wei / 1e18, 10),
+            'mev_percentage': round((mev_breakdown_wei / execution_wei * 100), 2) if execution_wei > 0 else 0,
+
+            'gas_used': details.get('gas_used', 0),
+            'gas_limit': details.get('gas_limit', 0),
+            'base_fee': details.get('base_fee_per_gas', 0),
+            'tx_count': details.get('transaction_count', 0),
+            'gas_utilization': round(details.get('gas_utilization', 0), 2),
+
+            'is_mev_boost_block': details.get('is_mev_boost_block', False),
+            'relay_tag': details.get('relay_tag', ''),
+            'builder_pubkey': details.get('builder_pubkey', ''),
+
+            'detailed_execution': {
+                'execution_reward_wei': execution_wei,
+                'mev_breakdown_wei': mev_breakdown_wei,
+                'traditional_fees_wei': details.get('traditional_fees_wei', 0),
+                **{k: v for k, v in details.items() if k.startswith(('block_reward', 'producer_reward'))}
+            }
+        }
 
     def _calculate_rewards(self, beacon_block: dict) -> Tuple[RewardComponents, dict]:
         slot = int(beacon_block['message']['slot'])
@@ -858,84 +857,98 @@ class EnhancedProposalTracker:
         execution_payload = beacon_block['message']['body']['execution_payload']
         fee_recipient = Web3.to_checksum_address(execution_payload['fee_recipient'])
         block_number = int(execution_payload['block_number'])
-        block_hash = execution_payload.get('block_hash', '')
-        
+
         graffiti_data = self._extract_graffiti_data(beacon_block)
-        
+
         consensus_wei, consensus_details = self._get_consensus_rewards_enhanced_local(slot, proposer_index, beacon_block)
-        execution_wei, mev_breakdown_wei, beaconchain_details = self._get_execution_rewards_beaconchain(slot, block_number)
-        
-        if execution_wei == 0 and beaconchain_details.get('data_source') != 'beaconchain_api':
-            execution_local_wei, execution_local_details = self._get_execution_rewards_local(execution_payload)
-            mev_local_wei, mev_local_details = self._detect_mev_heuristic(execution_payload)
-            
-            execution_wei = execution_local_wei + mev_local_wei
-            mev_breakdown_wei = mev_local_wei
-            
-            combined_details = {
-                **execution_local_details,
-                **{f"mev_{k}": v for k, v in mev_local_details.items()},
-                'execution_reward_wei': execution_wei,
-                'mev_breakdown_wei': mev_breakdown_wei,
-                'traditional_fees_wei': execution_local_wei,
-                'fallback_reason': 'beaconchain_api_failed'
-            }
-            
-        else:
-            combined_details = beaconchain_details
-        
+        execution_wei, mev_breakdown_wei, execution_details = self._get_execution_rewards(slot, block_number)
+
         rewards = RewardComponents(
             consensus_wei=consensus_wei,
             execution_wei=execution_wei,
             mev_wei=mev_breakdown_wei,
             data_sources=[
                 consensus_details.get('data_source', 'unknown'),
-                combined_details.get('data_source', 'unknown')
+                execution_details.get('data_source', 'unknown')
             ]
         )
-        
+
         all_details = {
             'slot': slot,
             'block_number': block_number,
             'proposer_index': proposer_index,
             'fee_recipient': fee_recipient,
-            
+
             **graffiti_data,
-            
+
             'consensus_reward_eth': round(consensus_wei / 1e18, 10),
-            'execution_fees_eth': round(execution_wei / 1e18, 10),
-            'mev_breakdown_eth': round(mev_breakdown_wei / 1e18, 10),
-            'mev_percentage': round((mev_breakdown_wei / execution_wei * 100), 2) if execution_wei > 0 else 0,
-            
-            'gas_used': combined_details.get('gas_used', 0),
-            'gas_limit': combined_details.get('gas_limit', 0),
-            'base_fee': combined_details.get('base_fee_per_gas', 0),
-            'tx_count': combined_details.get('transaction_count', 0),
-            'gas_utilization': round(combined_details.get('gas_utilization', 0), 2),
-            
-            'is_mev_boost_block': combined_details.get('is_mev_boost_block', False),
-            'relay_tag': combined_details.get('relay_tag', ''),
-            'builder_pubkey': combined_details.get('builder_pubkey', ''),
-            
+            **self._execution_fields(execution_wei, mev_breakdown_wei, execution_details),
+
             'total_rewards_wei': rewards.total_wei,
             'total_rewards_eth': round(rewards.total_wei / 1e18, 10),
-            
+
             'data_sources_used': rewards.data_sources,
-            'calculation_method': 'lighthouse_plus_beaconchain_plus_graffiti',
-            
+            'calculation_method': 'lighthouse_plus_relays_plus_graffiti',
+
             'detailed_consensus': {
                 'consensus_rewards_wei': consensus_wei,
                 **{k: v for k, v in consensus_details.items() if k.startswith(('attestation', 'sync', 'deposit', 'slashing', 'base_proposer'))}
-            },
-            'detailed_execution': {
-                'execution_reward_wei': execution_wei,
-                'mev_breakdown_wei': mev_breakdown_wei,
-                'traditional_fees_wei': combined_details.get('traditional_fees_wei', 0),
-                **{k: v for k, v in combined_details.items() if k.startswith(('block_reward', 'producer_reward'))}
             }
         }
-        
+
         return rewards, all_details
+
+    def backfill_execution_rewards(self, max_age_days: Optional[int] = None) -> int:
+        """
+        Recompute execution/MEV data for proposals whose execution data source is not final
+        (e.g. beaconcha.in failures, incomplete relay lookups). Consensus rewards are kept as-is.
+        """
+        proposals = self._load_existing_proposals()
+        cutoff = time.time() - max_age_days * 86400 if max_age_days else 0
+
+        targets = [
+            p for p in proposals
+            if p.get('timestamp', 0) >= cutoff
+            and (p.get('data_sources_used') or ['unknown'])[-1] not in FINAL_EXECUTION_SOURCES
+        ]
+
+        if not targets:
+            return 0
+
+        print(f"\nBackfilling execution/MEV data for {len(targets)} proposals")
+        updated = 0
+        mev_blocks = 0
+
+        for i, proposal in enumerate(targets, 1):
+            execution_wei, mev_wei, details = self._get_execution_rewards(proposal['slot'], proposal['block_number'])
+            if details.get('data_source') == 'execution_lookup_failed':
+                continue
+
+            consensus_wei = proposal.get('detailed_consensus', {}).get(
+                'consensus_rewards_wei', proposal.get('consensus_reward_eth', 0) * 1e18)
+            total_wei = consensus_wei + execution_wei
+            consensus_source = (proposal.get('data_sources_used') or ['unknown'])[0]
+
+            proposal.update(self._execution_fields(execution_wei, mev_wei, details))
+            proposal.update({
+                'total_value_wei': total_wei,
+                'total_value_eth': round(total_wei / 1e18, 10),
+                'total_rewards_wei': total_wei,
+                'total_rewards_eth': round(total_wei / 1e18, 10),
+                'data_sources_used': [consensus_source, details['data_source']],
+                'calculation_method': 'lighthouse_plus_relays_plus_graffiti'
+            })
+            updated += 1
+            if details.get('is_mev_boost_block'):
+                mev_blocks += 1
+
+            if i % 50 == 0:
+                print(f"  Progress: {i}/{len(targets)} proposals, {mev_blocks} MEV-Boost blocks")
+
+        self._save_proposals(proposals)
+        print(f"Backfill complete: {updated}/{len(targets)} proposals updated, {mev_blocks} MEV-Boost blocks")
+        logging.info("Backfilled execution data for %d/%d proposals (%d MEV-Boost)", updated, len(targets), mev_blocks)
+        return updated
 
     def _format_operator_name(self, validator_info: dict) -> str:
         ens_name = validator_info.get('ens_name')
@@ -1053,8 +1066,8 @@ class EnhancedProposalTracker:
                     'mev_boost_blocks': mev_boost_count,
                     'mev_boost_percentage': (mev_boost_count / total_proposals * 100) if total_proposals > 0 else 0,
                     'operators_tracked': len(operator_stats),
-                    'data_sources': ['local_lighthouse', 'beaconchain_api', 'graffiti_analysis'],
-                    'calculation_method': 'lighthouse_plus_beaconchain_plus_graffiti'
+                    'data_sources': ['local_lighthouse', 'execution_client', 'mev_relay_api', 'graffiti_analysis'],
+                    'calculation_method': 'lighthouse_plus_relays_plus_graffiti'
                 },
                 'client_diversity': client_diversity,
                 'operator_summary': {
@@ -1638,6 +1651,7 @@ class EnhancedProposalTracker:
         print("Scanning for both successful and missed proposals...")
         
         successful_found = self.scan_proposals(max_slots)
+        self.backfill_execution_rewards(max_age_days=AUTO_RETRY_DAYS)
         missed_found, slots_checked = self.scan_for_missed_proposals()
         
         self.generate_comprehensive_report()
@@ -1664,6 +1678,10 @@ def main():
 
     tracker = EnhancedProposalTracker(eth_client_url, beacon_api_url, enable_external_apis=True)
     
+    if '--backfill-mev' in sys.argv:
+        tracker.backfill_execution_rewards()
+        return
+
     # Option to force revalidation for testing
     force_revalidation = '--force-revalidation' in sys.argv
     
